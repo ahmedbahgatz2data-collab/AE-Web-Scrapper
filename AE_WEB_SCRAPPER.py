@@ -4,14 +4,12 @@ import json
 import sys
 import subprocess
 import time
-import random
 import queue
 import datetime
 import threading
 import zipfile
 import urllib.parse
 import tkinter as tk
-import tkinter.font as tkfont
 from tkinter import ttk, filedialog, messagebox, scrolledtext, simpledialog
 
 from selenium import webdriver
@@ -43,7 +41,6 @@ LIST_OPTS = dict(
     bg="white", fg=TEXT, selectbackground=BLUE, selectforeground="white",
 )
 
-# سكريبت الالتقاط البصري: يلتقط العنصر الفردي + يقترح Selector عام للعناصر المتكررة (مثل صفوف الجداول)
 REC_JS = r"""
 (function () {
   if (window.__recInstalled) return;
@@ -99,8 +96,24 @@ REC_JS = r"""
     return parts.join(' > ');
   }
 
-  // بناء Selector عام يطابق كل العناصر المتكررة في نفس العمود أو القائمة
+  // بناء Selector عام يطابق العمود الرأسي بالكامل في الجداول والقوائم
   function buildMultiSelector(el) {
+    // 1. إذا كان العنصر داخل خلية جدول (td أو th)، نعمم الصف (tr) ونثبت رقم العمود (td:nth-of-type)
+    var td = el.closest('td, th');
+    if (td) {
+      var tr = td.parentElement;
+      var table = td.closest('table');
+      if (tr && table) {
+        var colIdx = Array.from(tr.children).indexOf(td) + 1;
+        var tablePrefix = table.id ? ('#' + CSS.escape(table.id)) : buildExactSelector(table);
+        var section = tr.parentElement && (tr.parentElement.tagName === 'TBODY' || tr.parentElement.tagName === 'THEAD')
+          ? (' > ' + tr.parentElement.tagName.toLowerCase()) : '';
+        var colSel = tablePrefix + section + ' > tr > ' + td.tagName.toLowerCase() + ':nth-of-type(' + colIdx + ')';
+        if (count(colSel) > 1) return colSel;
+      }
+    }
+
+    // 2. للقوائم غير الجدولية (مثل البطاقات أو عناصر li)
     var parts = [];
     var cur = el;
     var generalized = false;
@@ -121,9 +134,8 @@ REC_JS = r"""
         var sibs = Array.from(parent.children).filter(function (c) {
           return c.tagName === cur.tagName;
         });
-        // إذا كان الأب صف جدول (tr) أو عنصر قائمة (li) متكرر، لا نضع nth-of-type لكي يشمل كل الصفوف
         if (sibs.length > 1) {
-          if (!generalized && (cur.tagName === 'TR' || cur.tagName === 'LI' || sibs.length >= 3)) {
+          if (!generalized && (cur.tagName === 'LI' || sibs.length >= 3)) {
             generalized = true;
           } else {
             part += ':nth-of-type(' + (sibs.indexOf(cur) + 1) + ')';
@@ -158,6 +170,8 @@ REC_JS = r"""
         t.style.outline = '2px solid #62C93F';
       }
 
+      var anchor = t.closest('a') || t.querySelector('a');
+      var sampleHref = anchor ? (anchor.href || '') : '';
       var exactSel = buildExactSelector(t);
       var multiSel = buildMultiSelector(t);
       var multiCount = count(multiSel);
@@ -168,7 +182,8 @@ REC_JS = r"""
         selector: exactSel,
         multi_selector: multiSel,
         multi_count: multiCount,
-        sample: sampleText
+        sample: sampleText,
+        sample_href: sampleHref
       };
       console.log('__REC__' + encodeURIComponent(JSON.stringify(data)));
     } catch (err) {}
@@ -186,6 +201,39 @@ def parse_selector(sel):
         lit = "'" + sel[5:].strip() + "'"
         return By.XPATH, f"//*[text()[contains(normalize-space(.), {lit})]]"
     return By.CSS_SELECTOR, sel
+
+
+def extract_element_value(el, attr_mode):
+    """استخراج النص أو الرابط (href) أو كليهما من العنصر."""
+    txt = ""
+    href = ""
+    try:
+        txt = (el.text or el.get_attribute("innerText") or el.get_attribute("value") or "").strip()
+        txt = re.sub(r"\s+", " ", txt)
+    except Exception:
+        pass
+
+    if attr_mode in ("href", "both"):
+        try:
+            href = el.get_attribute("href") or el.get_attribute("src") or ""
+            if not href:
+                sub_links = el.find_elements(By.TAG_NAME, "a")
+                if sub_links:
+                    href = sub_links[0].get_attribute("href") or ""
+            if not href:
+                anc = el.find_elements(By.XPATH, "./ancestor::a[1]")
+                if anc:
+                    href = anc[0].get_attribute("href") or ""
+        except Exception:
+            pass
+
+    if attr_mode == "href":
+        return href.strip()
+    if attr_mode == "both":
+        if txt and href:
+            return f"{txt} ({href.strip()})"
+        return href.strip() or txt
+    return txt
 
 
 def apply_stealth_options(options):
@@ -255,13 +303,13 @@ def num(var, default):
 
 ALL_SITES = "*"
 ALL_SITES_LABEL = "All sites (default)"
-APP_VERSION = "3.0.0-multi-site-scraper"
-SITE_OPT_KEYS = ("load_wait", "step_timeout", "step_delay", "after_steps", "url_delay", "stop_loading", "stealth", "headless", "new_browser")
+APP_VERSION = "3.3.0-table-col-fix"
+SITE_OPT_KEYS = ("load_wait", "step_timeout", "step_delay", "url_delay", "stop_loading", "stealth", "headless", "new_browser")
 
 
 def settings_file():
     base = os.environ.get("APPDATA") or os.path.join(os.path.expanduser("~"), ".config")
-    return os.path.join(base, "WebScraperTool", "settings_v5.json")
+    return os.path.join(base, "WebScraperTool", "settings_v6.json")
 
 
 def host_of(url):
@@ -281,7 +329,6 @@ def host_matches(host, key):
 
 
 def resolve_site_key(sets_dict, url):
-    """إرجاع مفتاح الموقع المطابق للرابط (أو '*' كافتراضي)."""
     host = host_of(url)
     best = None
     for key in sets_dict:
@@ -294,7 +341,6 @@ def resolve_site_key(sets_dict, url):
 
 
 def apply_site_cfg(base_cfg, url):
-    """دمج الإعدادات العامة مع الإعدادات المخصصة للموقع الخاص بهذا الرابط."""
     host = host_of(url)
     site_settings = base_cfg.get("site_settings") or {}
     best = None
@@ -333,7 +379,6 @@ def safe_sheet_name(name, used):
 
 
 def write_multi_sheet_xlsx(path, sheets_dict):
-    """تصدير ملف Excel متعدد الأوراق (ورقة مستقلة لكل موقع + ورقة شاملة) بدون مكتبات خارجية."""
     head = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n'
     ns_main = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
     ns_rel = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
@@ -419,7 +464,7 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title(f"Multi-Site Sequential Web Scraper Pro  v{APP_VERSION}")
-        self.geometry("1160x820")
+        self.geometry("1180x830")
         self.minsize(980, 680)
 
         self.msg_queue = queue.Queue()
@@ -430,6 +475,7 @@ class App(tk.Tk):
         self.rec_driver = None
         self.live_drivers = set()
         self.opt_visible = False
+        self.drag_index = None
 
         self.sequence_sets = {ALL_SITES: []}
         self.site_settings = {}
@@ -447,7 +493,6 @@ class App(tk.Tk):
         self.var_url_delay = tk.DoubleVar(value=0)
         self.var_step_timeout = tk.DoubleVar(value=10)
         self.var_step_delay = tk.DoubleVar(value=1)
-        self.var_after_steps = tk.DoubleVar(value=2)
         self.var_continue = tk.BooleanVar(value=True)
         self.var_retries = tk.IntVar(value=2)
         self.var_workers = tk.IntVar(value=1)
@@ -459,9 +504,9 @@ class App(tk.Tk):
             "dedupe": self.var_dedupe, "browser_mode": self.var_browser_mode,
             "headless": self.var_headless, "stealth": self.var_stealth,
             "url_delay": self.var_url_delay, "step_timeout": self.var_step_timeout,
-            "step_delay": self.var_step_delay, "after_steps": self.var_after_steps,
-            "continue": self.var_continue, "retries": self.var_retries,
-            "workers": self.var_workers, "resume": self.var_resume,
+            "step_delay": self.var_step_delay, "continue": self.var_continue,
+            "retries": self.var_retries, "workers": self.var_workers,
+            "resume": self.var_resume,
         }
         self.load_settings()
         self.build_ui()
@@ -516,6 +561,35 @@ class App(tk.Tk):
                 json.dump(data, f, indent=2, ensure_ascii=False)
         except OSError:
             pass
+
+    def export_settings_file(self):
+        self.save_settings()
+        f = filedialog.asksaveasfilename(title="Export Settings JSON", defaultextension=".json", initialfile="scraper_settings.json", filetypes=[("JSON files", "*.json")])
+        if f:
+            try:
+                with open(settings_file(), encoding="utf-8") as src, open(f, "w", encoding="utf-8") as dst:
+                    dst.write(src.read())
+                self.log(f"Settings exported to: {f}")
+            except Exception as e:
+                messagebox.showerror("Export Settings", f"Error:\n{e}")
+
+    def import_settings_file(self):
+        f = filedialog.askopenfilename(title="Import Settings JSON", filetypes=[("JSON files", "*.json")])
+        if f:
+            try:
+                with open(f, encoding="utf-8") as src:
+                    content = src.read()
+                json.loads(content)
+                path = settings_file()
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                with open(path, "w", encoding="utf-8") as dst:
+                    dst.write(content)
+                self.load_settings()
+                self.refresh_sets()
+                self.refresh_sequence()
+                self.log(f"Settings imported from: {f}")
+            except Exception as e:
+                messagebox.showerror("Import Settings", f"Invalid settings file:\n{e}")
 
     def build_ui(self):
         self.apply_theme()
@@ -588,13 +662,13 @@ class App(tk.Tk):
         ttk.Checkbutton(checks, text="Continue if step missing", variable=self.var_continue).pack(side="left")
 
         # ----- Site Profile Management Bar -----
-        site_bar = ttk.LabelFrame(self, text="Site Profile & Per-Site Customization")
+        site_bar = ttk.LabelFrame(self, text="Site Profile, Per-Site Customization & Local Settings Backup")
         site_bar.pack(fill="x", padx=10, pady=(6, 0))
         sb_in = ttk.Frame(site_bar)
         sb_in.pack(fill="x", padx=8, pady=6)
 
         ttk.Label(sb_in, text="Active Site:").pack(side="left")
-        self.cmb_set = ttk.Combobox(sb_in, state="readonly", width=28)
+        self.cmb_set = ttk.Combobox(sb_in, state="readonly", width=26)
         self.cmb_set.pack(side="left", padx=(6, 6))
         self.cmb_set.bind("<<ComboboxSelected>>", self.on_set_selected)
 
@@ -603,6 +677,8 @@ class App(tk.Tk):
         ttk.Button(sb_in, text="Site Options...", style="Accent.TButton", command=self.edit_site_options).pack(side="left", padx=4)
         ttk.Button(sb_in, text="Delete site", command=self.delete_site).pack(side="left", padx=4)
 
+        ttk.Button(sb_in, text="Import Settings", command=self.import_settings_file).pack(side="right", padx=(4, 0))
+        ttk.Button(sb_in, text="Export Settings", command=self.export_settings_file).pack(side="right", padx=(8, 0))
         self.lbl_site_info = ttk.Label(sb_in, text="", foreground="#0E8EE6")
         self.lbl_site_info.pack(side="right", padx=8)
 
@@ -627,11 +703,15 @@ class App(tk.Tk):
         self.lbl_count.pack(side="right")
         self.txt_links.bind("<<Modified>>", self.on_links_modified)
 
-        # 2. Sequential Workflow (Supports Single & Multi-Row Repeating Elements)
-        seq_box = ttk.LabelFrame(mid, text="2. Site Workflow (Clicks & Single/Multi Extractions in Exact Order)")
-        mid.add(seq_box, stretch="always", minsize=520)
+        # 2. Sequential Workflow (Drag & Drop Reordering + Text/Link Extraction + First-Link Scope)
+        seq_box = ttk.LabelFrame(mid, text="2. Site Workflow (Drag & Drop rows to reorder)")
+        mid.add(seq_box, stretch="always", minsize=540)
         self.lst_seq = tk.Listbox(seq_box, height=8, activestyle="none", exportselection=False, **LIST_OPTS)
         self.lst_seq.pack(fill="both", expand=True, padx=6, pady=(6, 4))
+
+        self.lst_seq.bind("<Button-1>", self.on_drag_start)
+        self.lst_seq.bind("<B1-Motion>", self.on_drag_motion)
+        self.lst_seq.bind("<ButtonRelease-1>", self.on_drag_release)
 
         sr1 = ttk.Frame(seq_box)
         sr1.pack(fill="x", padx=6, pady=2)
@@ -644,10 +724,12 @@ class App(tk.Tk):
 
         sr2 = ttk.Frame(seq_box)
         sr2.pack(fill="x", padx=6, pady=(2, 6))
-        ttk.Button(sr2, text="Rename Field", command=self.rename_seq).pack(side="left")
-        ttk.Button(sr2, text="Toggle Single/Multi List", command=self.toggle_multi_mode).pack(side="left", padx=4)
-        ttk.Button(sr2, text="Delete", command=self.delete_seq_item).pack(side="left", padx=4)
-        ttk.Button(sr2, text="Up", width=4, command=lambda: self.move_seq(-1)).pack(side="left", padx=2)
+        ttk.Button(sr2, text="Rename", command=self.rename_seq).pack(side="left")
+        ttk.Button(sr2, text="Text / Link (href)", command=self.toggle_extract_attr).pack(side="left", padx=3)
+        ttk.Button(sr2, text="Single / Multi List", command=self.toggle_multi_mode).pack(side="left", padx=3)
+        ttk.Button(sr2, text="All Links / 1st Link Only", command=self.toggle_first_link_only).pack(side="left", padx=3)
+        ttk.Button(sr2, text="Delete", command=self.delete_seq_item).pack(side="left", padx=3)
+        ttk.Button(sr2, text="Up", width=3, command=lambda: self.move_seq(-1)).pack(side="left", padx=2)
         ttk.Button(sr2, text="Down", width=5, command=lambda: self.move_seq(1)).pack(side="left")
         ttk.Button(sr2, text="Clear", command=self.clear_seq).pack(side="right")
 
@@ -661,6 +743,27 @@ class App(tk.Tk):
         self.refresh_sequence()
         self.update_summary()
         self.set_options(False)
+
+    # ----- Drag & Drop Handlers for Step Reordering -----
+    def on_drag_start(self, event):
+        idx = self.lst_seq.nearest(event.y)
+        if 0 <= idx < len(self.sequence):
+            self.drag_index = idx
+            self.lst_seq.selection_clear(0, "end")
+            self.lst_seq.selection_set(idx)
+
+    def on_drag_motion(self, event):
+        if self.drag_index is None:
+            return
+        target = self.lst_seq.nearest(event.y)
+        if 0 <= target < len(self.sequence) and target != self.drag_index:
+            item = self.sequence.pop(self.drag_index)
+            self.sequence.insert(target, item)
+            self.drag_index = target
+            self.refresh_sequence(select=target)
+
+    def on_drag_release(self, _event):
+        self.drag_index = None
 
     def apply_theme(self):
         self.configure(bg=BG)
@@ -677,8 +780,8 @@ class App(tk.Tk):
             if bold:
                 s.configure(name, font=("Segoe UI", 10, "bold"))
 
-        flat_button("TButton", TAB, "#333333", "#DDDDDD", "#D0D0D0", "#F4F4F4", "#A8A8A8", (8, 4))
-        flat_button("Accent.TButton", BLUE, "white", BLUE_DARK, "#0A7DCC", "#A8D9FB", "white", (12, 5), bold=True)
+        flat_button("TButton", TAB, "#333333", "#DDDDDD", "#D0D0D0", "#F4F4F4", "#A8A8A8", (7, 4))
+        flat_button("Accent.TButton", BLUE, "white", BLUE_DARK, "#0A7DCC", "#A8D9FB", "white", (11, 5), bold=True)
         flat_button("Toolbar.TButton", NAVY, "#E6EAF2", NAVY_HOVER, "#2A3142", NAVY, "#7A859B", (12, 8))
 
         s.configure("Horizontal.TProgressbar", troughcolor="#D5DBE4", background=BLUE, thickness=10)
@@ -702,14 +805,14 @@ class App(tk.Tk):
         extract_count = sum(1 for item in self.sequence if item["type"] == "extract")
         sites_count = len([k for k in self.sequence_sets if k != ALL_SITES])
         self.lbl_summary.config(
-            text=f"Configured Sites: {sites_count}   \u00B7   Current Steps: {len(self.sequence)} ({extract_count} fields)   \u00B7   Workers: {num(self.var_workers, 1)}"
+            text=f"Sites: {sites_count}   \u00B7   Steps: {len(self.sequence)} ({extract_count} fields)   \u00B7   Workers: {num(self.var_workers, 1)}   \u00B7   Auto-Saved Locally"
         )
         if self.current_set == ALL_SITES:
             self.lbl_site_info.config(text="Using Global Options")
         elif self.current_set in self.site_settings:
-            self.lbl_site_info.config(text=f"Custom Options Active for [{self.current_set}]")
+            self.lbl_site_info.config(text=f"Custom Options: [{self.current_set}]")
         else:
-            self.lbl_site_info.config(text=f"Inheriting Global Options for [{self.current_set}]")
+            self.lbl_site_info.config(text=f"Global Options: [{self.current_set}]")
 
     def update_link_count(self):
         links = self.get_links()
@@ -727,7 +830,6 @@ class App(tk.Tk):
         return list(dict.fromkeys(links)) if (dedupe and self.var_dedupe.get()) else links
 
     def auto_detect_sites(self):
-        """اكتشاف جميع المواقع الموجودة في قائمة الروابط وإضافتها تلقائياً للقائمة المنسدلة."""
         links = self.get_links()
         added = 0
         for u in links:
@@ -781,7 +883,6 @@ class App(tk.Tk):
 
         sheets_dict = {}
         for site_key, records in by_site.items():
-            # جمع أسماء الأعمدة الخاصة بهذا الموقع بالترتيب
             field_names = []
             for r in records:
                 for k in r.get("fields", {}).keys():
@@ -864,7 +965,6 @@ class App(tk.Tk):
             self.refresh_sequence()
 
     def edit_site_options(self):
-        """نافذة تخصيص الإعدادات (Options) المستقلة لكل موقع على حدة."""
         if self.current_set == ALL_SITES:
             messagebox.showinfo("Site Options", "Select a specific site first (or click '+ New site...') to customize its options.")
             return
@@ -935,17 +1035,44 @@ class App(tk.Tk):
         self.lst_seq.delete(0, "end")
         for n, item in enumerate(self.sequence, 1):
             t = item["type"]
+            scope_tag = " [1ST LINK ONLY]" if item.get("first_link_only") else ""
             if t == "wait":
-                txt = f"{n}. [WAIT] {item['seconds']:g} s"
+                txt = f"{n}.{scope_tag} [WAIT] {item['seconds']:g} s"
             elif t == "click":
-                txt = f"{n}. [CLICK] -> {item['selector']}"
+                txt = f"{n}.{scope_tag} [CLICK] -> {item['selector']}"
             elif t == "extract":
-                mode_tag = "MULTI-ROWS LIST" if item.get("multi") else "SINGLE VALUE"
-                txt = f"{n}. [EXTRACT ({mode_tag}): {item['name']}] -> {item['selector']}"
+                mode_tag = "MULTI-LIST" if item.get("multi") else "SINGLE"
+                attr_map = {"text": "TEXT", "href": "LINK (href)", "both": "TEXT + LINK"}
+                attr_tag = attr_map.get(item.get("extract_attr", "text"), "TEXT")
+                txt = f"{n}.{scope_tag} [EXTRACT {attr_tag} | {mode_tag}: {item['name']}] -> {item['selector']}"
             self.lst_seq.insert("end", txt)
         if select is not None and 0 <= select < len(self.sequence):
             self.lst_seq.selection_set(select)
         self.update_summary()
+
+    def toggle_first_link_only(self):
+        sel = self.lst_seq.curselection()
+        if not sel:
+            return
+        idx = sel[0]
+        item = self.sequence[idx]
+        item["first_link_only"] = not item.get("first_link_only", False)
+        self.refresh_sequence(select=idx)
+
+    def toggle_extract_attr(self):
+        sel = self.lst_seq.curselection()
+        if not sel:
+            return
+        idx = sel[0]
+        item = self.sequence[idx]
+        if item["type"] != "extract":
+            messagebox.showinfo("Info", "Select an Extract field first.")
+            return
+        order = ["text", "href", "both"]
+        cur = item.get("extract_attr", "text")
+        nxt = order[(order.index(cur) + 1) % len(order)]
+        item["extract_attr"] = nxt
+        self.refresh_sequence(select=idx)
 
     def toggle_multi_mode(self):
         sel = self.lst_seq.curselection()
@@ -962,18 +1089,21 @@ class App(tk.Tk):
         self.refresh_sequence(select=idx)
 
     def add_manual_extract(self):
-        name = simpledialog.askstring("Field Name", "Column Name (e.g. Part Number, Status):", parent=self)
+        name = simpledialog.askstring("Field Name", "Column Name (e.g. Part Number, Datasheet Link):", parent=self)
         if not name or not name.strip():
             return
         sel = simpledialog.askstring("Selector", f"CSS or xpath= selector for '{name.strip()}':", parent=self)
         if not sel or not sel.strip():
             return
-        is_multi = messagebox.askyesno("Extraction Mode", "Does this selector match MULTIPLE repeating items (rows) on the same page?")
+        is_multi = messagebox.askyesno("Extraction Mode", "Does this selector match MULTIPLE repeating items on the same page?")
+        is_link = messagebox.askyesno("Data Type", "Do you want to extract the LINK (href) instead of visible text?")
         self.sequence.append({
             "type": "extract",
             "name": name.strip(),
             "selector": sel.strip(),
             "multi": is_multi,
+            "extract_attr": "href" if is_link else "text",
+            "first_link_only": False,
         })
         self.refresh_sequence(select=len(self.sequence) - 1)
 
@@ -1001,7 +1131,7 @@ class App(tk.Tk):
     def add_wait(self):
         sec = simpledialog.askfloat("Wait", "Seconds to wait:", minvalue=0.1, maxvalue=60, parent=self)
         if sec:
-            self.sequence.append({"type": "wait", "seconds": sec})
+            self.sequence.append({"type": "wait", "seconds": sec, "first_link_only": False})
             self.refresh_sequence(select=len(self.sequence) - 1)
 
     def rename_seq(self):
@@ -1023,11 +1153,20 @@ class App(tk.Tk):
             return
         links = self.get_links()
         if self.current_set != ALL_SITES:
-            url = next((u for u in links if host_matches(host_of(u), self.current_set)), "https://" + self.current_set)
+            matched = [u for u in links if host_matches(host_of(u), self.current_set)]
+            if matched:
+                url = matched[0]
+            elif "." in self.current_set:
+                url = "https://" + self.current_set
+            else:
+                url = links[0] if links else simpledialog.askstring("Sample URL", "Enter full URL to open:", parent=self)
         else:
-            url = links[0] if links else simpledialog.askstring("Sample URL", "Enter URL to open:", parent=self)
+            url = links[0] if links else simpledialog.askstring("Sample URL", "Enter full URL to open:", parent=self)
+
         if not url:
             return
+        if not url.startswith(("http://", "https://")):
+            url = "https://" + url
 
         self.rec_mode = mode
         self.rec_stop.clear()
@@ -1109,9 +1248,16 @@ class App(tk.Tk):
                 elif kind == "rec_event":
                     m = data.get("type")
                     if m == "click":
-                        self.sequence.append({"type": "click", "selector": data["selector"]})
+                        first_only = messagebox.askyesno(
+                            "Click Scope",
+                            f"Recorded Click: {data['selector']}\n\nRun this click on the FIRST link of this domain only (e.g. Cookie banner)?\n(Click 'No' to run on ALL links)"
+                        )
+                        self.sequence.append({
+                            "type": "click",
+                            "selector": data["selector"],
+                            "first_link_only": first_only,
+                        })
                         self.refresh_sequence(select=len(self.sequence) - 1)
-                        self.log(f"[{self.current_set}] Recorded Click: {data['selector']}")
                     elif m == "extract":
                         extract_count = sum(1 for item in self.sequence if item["type"] == "extract")
                         col_name = f"Field_{extract_count + 1}"
@@ -1122,15 +1268,24 @@ class App(tk.Tk):
 
                         if multi_count > 1:
                             ans = messagebox.askyesno(
-                                "Repeating Element Detected",
-                                f"Found {multi_count} similar repeating items on this page!\n\n"
+                                "Repeating Column/Items Detected",
+                                f"Found {multi_count} matching items in this column/list!\n"
                                 f"Sample: '{data.get('sample', '')}'\n\n"
-                                f"Do you want to extract ALL {multi_count} items as separate rows (Multi-Row List)?\n"
-                                f"(Click 'No' to extract only this single element)"
+                                f"Extract ALL {multi_count} items as separate rows (Multi-Row List)?"
                             )
                             if ans:
                                 use_multi = True
                                 chosen_sel, alt_sel = alt_sel, chosen_sel
+
+                        extract_attr = "text"
+                        if data.get("sample_href"):
+                            want_link = messagebox.askyesno(
+                                "Link Detected (href)",
+                                f"This element contains a link:\n{data['sample_href']}\n\n"
+                                f"Do you want to extract the LINK URL (href) instead of the text?"
+                            )
+                            if want_link:
+                                extract_attr = "href"
 
                         self.sequence.append({
                             "type": "extract",
@@ -1138,10 +1293,10 @@ class App(tk.Tk):
                             "selector": chosen_sel,
                             "multi_selector": alt_sel,
                             "multi": use_multi,
-                            "sample": data.get("sample", ""),
+                            "extract_attr": extract_attr,
+                            "first_link_only": False,
                         })
                         self.refresh_sequence(select=len(self.sequence) - 1)
-                        self.log(f"[{self.current_set}] Picked {col_name} ({'Multi-Row' if use_multi else 'Single'}): {chosen_sel}")
                 elif kind == "rec_done":
                     self.rec_mode = None
                     self.btn_rec_click.config(text="\u25CF Record Click", state="normal")
@@ -1177,7 +1332,6 @@ class App(tk.Tk):
             "stop_loading": self.var_stop_loading.get(),
             "step_timeout": num(self.var_step_timeout, 10),
             "step_delay": num(self.var_step_delay, 1),
-            "after_steps": num(self.var_after_steps, 2),
             "continue_missing": self.var_continue.get(),
             "sequence_sets": json.loads(json.dumps(self.sequence_sets)),
             "site_settings": json.loads(json.dumps(self.site_settings)),
@@ -1222,11 +1376,11 @@ class App(tk.Tk):
         site_key = resolve_site_key(cfg["sequence_sets"], link)
         scfg = apply_site_cfg(cfg, link)
         seq = cfg["sequence_sets"].get(site_key, [])
-        q.put(("log", f"TEST [{site_key}] on: {link}"))
+        q.put(("log", f"TEST [{site_key}] (First Link) on: {link}"))
         driver = None
         try:
             driver = self.new_driver(scfg)
-            page_title, rows_data, status, note = self.execute_sequence(driver, link, scfg, seq)
+            page_title, rows_data, status, note = self.execute_sequence(driver, link, scfg, seq, is_first_in_domain=True)
             q.put(("log", f"   Page Title: {page_title} | Extracted Rows: {len(rows_data)}"))
             for r_idx, fdict in enumerate(rows_data[:10], 1):
                 q.put(("log", f"   Row {r_idx}: {json.dumps(fdict, ensure_ascii=False)}"))
@@ -1262,12 +1416,7 @@ class App(tk.Tk):
             except Exception:
                 pass
 
-    def execute_sequence(self, driver, link, scfg, sequence):
-        """
-        ينفذ الخطوات بالترتيب ويدعم:
-        - حقول مفردة (Single Value)
-        - قوائم متكررة (Multi-Row List) مثل 20 Part Number + 20 Status في نفس الصفحة
-        """
+    def execute_sequence(self, driver, link, scfg, sequence, is_first_in_domain=False):
         driver.get(link)
         time.sleep(scfg["load_wait"])
         if scfg["stop_loading"]:
@@ -1275,9 +1424,12 @@ class App(tk.Tk):
 
         page_title = driver.title.strip()
         single_fields = {}
-        multi_fields = {}  # {field_name: [val1, val2, ...]}
+        multi_fields = {}
 
         for item in sequence:
+            if item.get("first_link_only") and not is_first_in_domain:
+                continue
+
             t = item["type"]
             if t == "wait":
                 time.sleep(item["seconds"])
@@ -1300,18 +1452,19 @@ class App(tk.Tk):
                 time.sleep(scfg["step_delay"])
             elif t == "extract":
                 by, val = parse_selector(item["selector"])
+                attr_mode = item.get("extract_attr", "text")
                 try:
                     els = driver.find_elements(by, val)
-                    texts = [e.text.strip() for e in els if e.text.strip()]
+                    vals = [extract_element_value(e, attr_mode) for e in els]
+                    vals = [v for v in vals if v]
                 except Exception:
-                    texts = []
+                    vals = []
 
                 if item.get("multi"):
-                    multi_fields[item["name"]] = texts
+                    multi_fields[item["name"]] = vals
                 else:
-                    single_fields[item["name"]] = " | ".join(texts) if texts else ""
+                    single_fields[item["name"]] = " | ".join(vals) if vals else ""
 
-        # دمج القوائم المتكررة في صفوف متوازية (Row 1, Row 2, ...)
         max_rows = max((len(v) for v in multi_fields.values()), default=1)
         max_rows = max(1, max_rows)
 
@@ -1329,7 +1482,7 @@ class App(tk.Tk):
         try:
             while not self.stop_event.is_set():
                 try:
-                    i, link = task_q.get_nowait()
+                    i, link, is_first_domain = task_q.get_nowait()
                 except queue.Empty:
                     break
 
@@ -1338,12 +1491,12 @@ class App(tk.Tk):
                 seq = cfg["sequence_sets"].get(site_key, [])
                 driver_sig = (scfg.get("headless"), scfg.get("stealth"))
 
-                # إعادة إنشاء المتصفح إذا تغيرت إعدادات الموقع التالي (مثلاً موقع يحتاج Stealth وموقع لا)
                 if holder["d"] is not None and holder["sig"] != driver_sig:
                     self.close_driver(holder["d"])
                     holder["d"] = None
 
-                self.msg_queue.put(("log", f"[{i + 1}/{ctx['total']}] ({site_key}) {link}"))
+                tag_1st = " [1st in Domain]" if is_first_domain else ""
+                self.msg_queue.put(("log", f"[{i + 1}/{ctx['total']}] ({site_key}){tag_1st} {link}"))
 
                 page_title, rows_data, status, note = "", [{}], "Error", ""
                 for attempt in range(1, cfg["retries"] + 2):
@@ -1353,7 +1506,9 @@ class App(tk.Tk):
                         if holder["d"] is None:
                             holder["d"] = self.new_driver(scfg)
                             holder["sig"] = driver_sig
-                        page_title, rows_data, status, note = self.execute_sequence(holder["d"], link, scfg, seq)
+                        page_title, rows_data, status, note = self.execute_sequence(
+                            holder["d"], link, scfg, seq, is_first_in_domain=is_first_domain
+                        )
                         break
                     except Exception as e:
                         note = str(e).splitlines()[0] if str(e) else type(e).__name__
@@ -1408,7 +1563,17 @@ class App(tk.Tk):
                     except Exception:
                         pass
 
-        todo = [(i, l) for i, l in enumerate(links) if l not in done_links]
+        seen_domains = set()
+        todo = []
+        for i, l in enumerate(links):
+            if l in done_links:
+                seen_domains.add(host_of(l))
+                continue
+            dom = host_of(l)
+            is_first = dom not in seen_domains
+            seen_domains.add(dom)
+            todo.append((i, l, is_first))
+
         if not os.path.exists(out_path) or not cfg["resume"]:
             open(out_path, "w", encoding="utf-8").close()
 
@@ -1428,7 +1593,7 @@ class App(tk.Tk):
             for t in threads:
                 t.join()
 
-        q.put(("log", f"Multi-site scraping finished! Click 'Export Excel (Multi-Sheet)' to view organized tabs."))
+        q.put(("log", "Multi-site scraping finished! Click 'Export Excel (Multi-Sheet)' to view organized tabs."))
         q.put(("done", None))
 
 
