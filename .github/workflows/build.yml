@@ -25,16 +25,16 @@ jobs:
         run: pip install selenium pyinstaller
 
       - name: Build exe
-        run: pyinstaller --onefile --windowed --clean --collect-all selenium --name WebToPDF AE_WEB_SCRAPPER.py
+        run: pyinstaller --onefile --windowed --clean --collect-all selenium --name AEWEBSCRAPPER AE_WEB_SCRAPPER.py
 
       - uses: actions/upload-artifact@v4
         with:
           name: WebToPDF
-          path: dist/AE WEB SCRAPPER.exe
+          path: dist/AEWEBSCRAPPER.exe
 
       - name: Publish release (tags only)
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/AE WEB SCRAPPER.exe
+          files: dist/AEWEBSCRAPPER.exe
           generate_release_notes: true
