@@ -4,6 +4,7 @@ import json
 import sys
 import subprocess
 import time
+import random
 import queue
 import datetime
 import threading
@@ -42,6 +43,7 @@ LIST_OPTS = dict(
     bg="white", fg=TEXT, selectbackground=BLUE, selectforeground="white",
 )
 
+# سكريبت الالتقاط البصري: يلتقط العنصر الفردي + يقترح Selector عام للعناصر المتكررة (مثل صفوف الجداول)
 REC_JS = r"""
 (function () {
   if (window.__recInstalled) return;
@@ -51,7 +53,11 @@ REC_JS = r"""
     try { return document.querySelectorAll(sel).length === 1; } catch (e) { return false; }
   }
 
-  function buildSelector(el) {
+  function count(sel) {
+    try { return document.querySelectorAll(sel).length; } catch (e) { return 0; }
+  }
+
+  function buildExactSelector(el) {
     var tag = el.tagName.toLowerCase();
     if (el.id && uniq('#' + CSS.escape(el.id))) return '#' + CSS.escape(el.id);
 
@@ -70,10 +76,6 @@ REC_JS = r"""
     for (var j = 0; j < classes.length; j++) {
       var s1 = tag + '.' + CSS.escape(classes[j]);
       if (uniq(s1)) return s1;
-    }
-    if (classes.length > 1) {
-      var s2 = tag + '.' + classes.map(function (c) { return CSS.escape(c); }).join('.');
-      if (uniq(s2)) return s2;
     }
 
     var parts = [];
@@ -97,6 +99,44 @@ REC_JS = r"""
     return parts.join(' > ');
   }
 
+  // بناء Selector عام يطابق كل العناصر المتكررة في نفس العمود أو القائمة
+  function buildMultiSelector(el) {
+    var parts = [];
+    var cur = el;
+    var generalized = false;
+    while (cur && cur.nodeType === 1 && cur !== document.documentElement) {
+      var part = cur.tagName.toLowerCase();
+      if (cur.id && uniq('#' + CSS.escape(cur.id))) {
+        parts.unshift('#' + CSS.escape(cur.id));
+        break;
+      }
+      var classes = Array.from(cur.classList).filter(function (c) {
+        return c.length < 35 && !/\d{2,}/.test(c) && !/active|selected|hover|focus/i.test(c);
+      });
+      if (classes.length > 0) {
+        part += '.' + classes.slice(0, 2).map(function (c) { return CSS.escape(c); }).join('.');
+      }
+      var parent = cur.parentElement;
+      if (parent) {
+        var sibs = Array.from(parent.children).filter(function (c) {
+          return c.tagName === cur.tagName;
+        });
+        // إذا كان الأب صف جدول (tr) أو عنصر قائمة (li) متكرر، لا نضع nth-of-type لكي يشمل كل الصفوف
+        if (sibs.length > 1) {
+          if (!generalized && (cur.tagName === 'TR' || cur.tagName === 'LI' || sibs.length >= 3)) {
+            generalized = true;
+          } else {
+            part += ':nth-of-type(' + (sibs.indexOf(cur) + 1) + ')';
+          }
+        }
+      }
+      parts.unshift(part);
+      cur = parent;
+    }
+    var sel = parts.join(' > ');
+    return count(sel) > 1 ? sel : buildExactSelector(el);
+  }
+
   var lastHovered = null;
   document.addEventListener('mouseover', function (e) {
     if (window.__recMode !== 'extract') return;
@@ -108,7 +148,9 @@ REC_JS = r"""
   document.addEventListener('click', function (e) {
     try {
       var mode = window.__recMode || 'click';
-      var t = e.target;
+      var t = (mode === 'click')
+        ? (e.target.closest('a,button,input,select,label,summary,[role=button],[role=tab],[onclick]') || e.target)
+        : e.target;
 
       if (mode === 'extract') {
         e.preventDefault();
@@ -116,10 +158,16 @@ REC_JS = r"""
         t.style.outline = '2px solid #62C93F';
       }
 
-      var sampleText = (t.innerText || t.value || t.getAttribute('aria-label') || '').trim().replace(/\s+/g, ' ').slice(0, 40);
+      var exactSel = buildExactSelector(t);
+      var multiSel = buildMultiSelector(t);
+      var multiCount = count(multiSel);
+      var sampleText = (t.innerText || t.value || t.getAttribute('aria-label') || '').trim().replace(/\s+/g, ' ').slice(0, 45);
+
       var data = {
         type: mode,
-        selector: buildSelector(t),
+        selector: exactSel,
+        multi_selector: multiSel,
+        multi_count: multiCount,
         sample: sampleText
       };
       console.log('__REC__' + encodeURIComponent(JSON.stringify(data)));
@@ -127,6 +175,7 @@ REC_JS = r"""
   }, true);
 })();
 """
+
 
 def parse_selector(sel):
     sel = sel.strip()
@@ -138,16 +187,30 @@ def parse_selector(sel):
         return By.XPATH, f"//*[text()[contains(normalize-space(.), {lit})]]"
     return By.CSS_SELECTOR, sel
 
+
 def apply_stealth_options(options):
     options.add_argument("--disable-blink-features=AutomationControlled")
     options.add_argument("--lang=en-US")
     options.add_experimental_option("excludeSwitches", ["enable-automation"])
 
+
 def apply_stealth_driver(driver):
     try:
-        driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {"source": "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"})
+        driver.execute_cdp_cmd(
+            "Page.addScriptToEvaluateOnNewDocument",
+            {"source": "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"},
+        )
     except Exception:
         pass
+    try:
+        ua = driver.execute_script("return navigator.userAgent")
+        driver.execute_cdp_cmd(
+            "Network.setUserAgentOverride",
+            {"userAgent": ua.replace("HeadlessChrome", "Chrome"), "acceptLanguage": "en-US,en;q=0.9"},
+        )
+    except Exception:
+        pass
+
 
 def open_file(path):
     try:
@@ -160,14 +223,17 @@ def open_file(path):
     except Exception:
         pass
 
+
 def make_service(path):
     return Service(executable_path=path) if path else Service()
+
 
 def is_displayed(el):
     try:
         return el.is_displayed()
     except Exception:
         return False
+
 
 def click_element(driver, el):
     try:
@@ -179,26 +245,33 @@ def click_element(driver, el):
     except Exception:
         driver.execute_script("arguments[0].click();", el)
 
+
 def num(var, default):
     try:
         return var.get()
     except tk.TclError:
         return default
 
+
 ALL_SITES = "*"
 ALL_SITES_LABEL = "All sites (default)"
-APP_VERSION = "2.4.0-headless-sequence"
+APP_VERSION = "3.0.0-multi-site-scraper"
+SITE_OPT_KEYS = ("load_wait", "step_timeout", "step_delay", "after_steps", "url_delay", "stop_loading", "stealth", "headless", "new_browser")
+
 
 def settings_file():
     base = os.environ.get("APPDATA") or os.path.join(os.path.expanduser("~"), ".config")
-    return os.path.join(base, "WebScraperTool", "settings_v4.json")
+    return os.path.join(base, "WebScraperTool", "settings_v5.json")
+
 
 def host_of(url):
     try:
         h = urllib.parse.urlparse(url if "//" in url else "//" + url).hostname or ""
     except ValueError:
         h = ""
-    return h.lower()[4:] if h.lower().startswith("www.") else h.lower()
+    h = h.lower()
+    return h[4:] if h.startswith("www.") else h
+
 
 def host_matches(host, key):
     key = (key or "").lower()
@@ -206,7 +279,9 @@ def host_matches(host, key):
         key = key[4:]
     return bool(key) and (host == key or host.endswith("." + key))
 
-def steps_for_url(sets_dict, url):
+
+def resolve_site_key(sets_dict, url):
+    """إرجاع مفتاح الموقع المطابق للرابط (أو '*' كافتراضي)."""
     host = host_of(url)
     best = None
     for key in sets_dict:
@@ -214,15 +289,29 @@ def steps_for_url(sets_dict, url):
             if best is None or len(key) > len(best):
                 best = key
     if best is not None and sets_dict[best]:
-        return sets_dict[best]
-    return sets_dict.get(ALL_SITES, [])
+        return best
+    return ALL_SITES
 
-def tsv(row):
-    return "\t".join(re.sub(r"[\t\r\n]+", " ", str(x)) for x in row) + "\n"
+
+def apply_site_cfg(base_cfg, url):
+    """دمج الإعدادات العامة مع الإعدادات المخصصة للموقع الخاص بهذا الرابط."""
+    host = host_of(url)
+    site_settings = base_cfg.get("site_settings") or {}
+    best = None
+    for key in site_settings:
+        if host_matches(host, key) and (best is None or len(key) > len(best)):
+            best = key
+    if not best:
+        return base_cfg
+    merged = dict(base_cfg)
+    merged.update({k: v for k, v in site_settings[best].items() if k in SITE_OPT_KEYS})
+    return merged
+
 
 def xml_escape(text):
     text = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f]", "", str(text))
     return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
 
 def col_letter(n):
     s, n = "", n + 1
@@ -231,43 +320,107 @@ def col_letter(n):
         s = chr(65 + r) + s
     return s
 
-def write_xlsx(path, rows):
+
+def safe_sheet_name(name, used):
+    clean = re.sub(r'[\\/*?:\[\]]+', "_", str(name)).strip()[:28] or "Sheet"
+    cand = clean
+    idx = 2
+    while cand.lower() in used:
+        cand = f"{clean[:24]}_{idx}"
+        idx += 1
+    used.add(cand.lower())
+    return cand
+
+
+def write_multi_sheet_xlsx(path, sheets_dict):
+    """تصدير ملف Excel متعدد الأوراق (ورقة مستقلة لكل موقع + ورقة شاملة) بدون مكتبات خارجية."""
     head = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n'
     ns_main = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
     ns_rel = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
     ns_pkg = "http://schemas.openxmlformats.org/package/2006/relationships"
 
-    col_count = max((len(r) for r in rows), default=1)
-    sheet = [head, f'<worksheet xmlns="{ns_main}">',
-             '<sheetViews><sheetView workbookViewId="0"><pane ySplit="1" topLeftCell="A2" '
-             'activePane="bottomLeft" state="frozen"/></sheetView></sheetViews>',
-             "<cols>" + "".join(f'<col min="{i}" max="{i}" width="28" customWidth="1"/>' for i in range(1, col_count + 1)) + "</cols>",
-             "<sheetData>"]
-    for r, row in enumerate(rows, 1):
-        style = ' s="1"' if r == 1 else ""
-        cells = "".join(f'<c r="{col_letter(c)}{r}" t="inlineStr"{style}><is><t xml:space="preserve">{xml_escape(v)}</t></is></c>' for c, v in enumerate(row))
-        sheet.append(f'<row r="{r}">{cells}</row>')
-    last_col = col_letter(col_count - 1)
-    sheet.append(f'</sheetData><autoFilter ref="A1:{last_col}{max(len(rows), 1)}"/></worksheet>')
+    used_names = set()
+    sheet_entries = []
+    for raw_name, rows in sheets_dict.items():
+        if not rows:
+            continue
+        sname = safe_sheet_name(raw_name, used_names)
+        sheet_entries.append((sname, rows))
+
+    if not sheet_entries:
+        sheet_entries = [("Data", [["No data"]])]
 
     parts = {
-        "[Content_Types].xml": head + '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/><Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/><Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/></Types>',
-        "_rels/.rels": head + f'<Relationships xmlns="{ns_pkg}"><Relationship Id="rId1" Type="{ns_rel}/officeDocument" Target="xl/workbook.xml"/></Relationships>',
-        "xl/workbook.xml": head + f'<workbook xmlns="{ns_main}" xmlns:r="{ns_rel}"><sheets><sheet name="Sequential Data" sheetId="1" r:id="rId1"/></sheets></workbook>',
-        "xl/_rels/workbook.xml.rels": head + f'<Relationships xmlns="{ns_pkg}"><Relationship Id="rId1" Type="{ns_rel}/worksheet" Target="worksheets/sheet1.xml"/><Relationship Id="rId2" Type="{ns_rel}/styles" Target="styles.xml"/></Relationships>',
-        "xl/styles.xml": head + f'<styleSheet xmlns="{ns_main}"><fonts count="2"><font><sz val="11"/><name val="Calibri"/></font><font><b/><sz val="11"/><name val="Calibri"/></font></fonts><fills count="2"><fill><patternFill patternType="none"/></fill><fill><patternFill patternType="gray125"/></fill></fills><borders count="1"><border><left/><right/><top/><bottom/><diagonal/></border></borders><cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs><cellXfs count="2"><xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/><xf numFmtId="0" fontId="1" fillId="0" borderId="0" xfId="0" applyFont="1"/></cellXfs><cellStyles count="1"><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles></styleSheet>',
-        "xl/worksheets/sheet1.xml": "".join(sheet),
+        "[Content_Types].xml": head
+        + '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+        '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
+        '<Default Extension="xml" ContentType="application/xml"/>'
+        '<Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>'
+        '<Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/>'
+        + "".join(
+            f'<Override PartName="/xl/worksheets/sheet{i}.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>'
+            for i in range(1, len(sheet_entries) + 1)
+        )
+        + "</Types>",
+        "_rels/.rels": head + f'<Relationships xmlns="{ns_pkg}">'
+        f'<Relationship Id="rId1" Type="{ns_rel}/officeDocument" Target="xl/workbook.xml"/></Relationships>',
+        "xl/workbook.xml": head + f'<workbook xmlns="{ns_main}" xmlns:r="{ns_rel}"><sheets>'
+        + "".join(
+            f'<sheet name="{xml_escape(sname)}" sheetId="{i}" r:id="rId{i}"/>'
+            for i, (sname, _) in enumerate(sheet_entries, 1)
+        )
+        + "</sheets></workbook>",
+        "xl/_rels/workbook.xml.rels": head + f'<Relationships xmlns="{ns_pkg}">'
+        + "".join(
+            f'<Relationship Id="rId{i}" Type="{ns_rel}/worksheet" Target="worksheets/sheet{i}.xml"/>'
+            for i in range(1, len(sheet_entries) + 1)
+        )
+        + f'<Relationship Id="rId{len(sheet_entries) + 1}" Type="{ns_rel}/styles" Target="styles.xml"/></Relationships>',
+        "xl/styles.xml": head + f'<styleSheet xmlns="{ns_main}">'
+        '<fonts count="2"><font><sz val="11"/><name val="Calibri"/></font>'
+        '<font><b/><sz val="11"/><name val="Calibri"/></font></fonts>'
+        '<fills count="2"><fill><patternFill patternType="none"/></fill>'
+        '<fill><patternFill patternType="gray125"/></fill></fills>'
+        '<borders count="1"><border><left/><right/><top/><bottom/><diagonal/></border></borders>'
+        '<cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs>'
+        '<cellXfs count="2"><xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/>'
+        '<xf numFmtId="0" fontId="1" fillId="0" borderId="0" xfId="0" applyFont="1"/></cellXfs>'
+        '<cellStyles count="1"><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles>'
+        "</styleSheet>",
     }
+
+    for i, (_sname, rows) in enumerate(sheet_entries, 1):
+        col_count = max((len(r) for r in rows), default=1)
+        sheet_xml = [
+            head, f'<worksheet xmlns="{ns_main}">',
+            '<sheetViews><sheetView workbookViewId="0"><pane ySplit="1" topLeftCell="A2" '
+            'activePane="bottomLeft" state="frozen"/></sheetView></sheetViews>',
+            "<cols>" + "".join(f'<col min="{c}" max="{c}" width="26" customWidth="1"/>' for c in range(1, col_count + 1)) + "</cols>",
+            "<sheetData>",
+        ]
+        for r, row in enumerate(rows, 1):
+            style = ' s="1"' if r == 1 else ""
+            cells = "".join(
+                f'<c r="{col_letter(c)}{r}" t="inlineStr"{style}>'
+                f'<is><t xml:space="preserve">{xml_escape(v)}</t></is></c>'
+                for c, v in enumerate(row)
+            )
+            sheet_xml.append(f'<row r="{r}">{cells}</row>')
+        last_col = col_letter(col_count - 1)
+        sheet_xml.append(f'</sheetData><autoFilter ref="A1:{last_col}{max(len(rows), 1)}"/></worksheet>')
+        parts[f"xl/worksheets/sheet{i}.xml"] = "".join(sheet_xml)
+
     with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as z:
         for name, content in parts.items():
             z.writestr(name, content)
 
+
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title(f"Sequential Web Scraper Pro  v{APP_VERSION}")
-        self.geometry("1120x800")
-        self.minsize(960, 680)
+        self.title(f"Multi-Site Sequential Web Scraper Pro  v{APP_VERSION}")
+        self.geometry("1160x820")
+        self.minsize(980, 680)
 
         self.msg_queue = queue.Queue()
         self.stop_event = threading.Event()
@@ -279,6 +432,7 @@ class App(tk.Tk):
         self.opt_visible = False
 
         self.sequence_sets = {ALL_SITES: []}
+        self.site_settings = {}
         self.current_set = ALL_SITES
         self.saved_links = ""
 
@@ -288,7 +442,7 @@ class App(tk.Tk):
         self.var_stop_loading = tk.BooleanVar(value=True)
         self.var_dedupe = tk.BooleanVar(value=True)
         self.var_browser_mode = tk.StringVar(value="single")
-        self.var_headless = tk.BooleanVar(value=True)  # مفعل افتراضياً للعمل في الخلفية بصمت
+        self.var_headless = tk.BooleanVar(value=True)
         self.var_stealth = tk.BooleanVar(value=False)
         self.var_url_delay = tk.DoubleVar(value=0)
         self.var_step_timeout = tk.DoubleVar(value=10)
@@ -342,7 +496,9 @@ class App(tk.Tk):
         if isinstance(data.get("sequence_sets"), dict):
             self.sequence_sets = data["sequence_sets"]
             self.sequence_sets.setdefault(ALL_SITES, [])
-        if data.get("current_set") in self.sequence_sets:
+        if isinstance(data.get("site_settings"), dict):
+            self.site_settings = data["site_settings"]
+        if data.get("current_set") in (set(self.sequence_sets) | set(self.site_settings)):
             self.current_set = data["current_set"]
         if isinstance(data.get("links"), str):
             self.saved_links = data["links"]
@@ -350,6 +506,7 @@ class App(tk.Tk):
     def save_settings(self):
         data = {key: var.get() for key, var in self.persist.items() if hasattr(var, "get")}
         data["sequence_sets"] = self.sequence_sets
+        data["site_settings"] = self.site_settings
         data["current_set"] = self.current_set
         data["links"] = self.txt_links.get("1.0", "end").strip()
         try:
@@ -364,11 +521,12 @@ class App(tk.Tk):
         self.apply_theme()
         pad = {"padx": 8, "pady": 4}
 
+        # ----- Toolbar -----
         self.toolbar = ttk.Frame(self, style="Toolbar.TFrame")
         self.toolbar.pack(side="top", fill="x")
         tb = ttk.Frame(self.toolbar, style="Toolbar.TFrame")
         tb.pack(fill="x", padx=12, pady=10)
-        self.btn_start = ttk.Button(tb, text="\u25B6 Start Scraping", style="Accent.TButton", command=self.start)
+        self.btn_start = ttk.Button(tb, text="\u25B6 Start Multi-Site Scraping", style="Accent.TButton", command=self.start)
         self.btn_start.pack(side="left")
         self.btn_stop = ttk.Button(tb, text="\u25A0 Stop", style="Toolbar.TButton", command=self.stop, state="disabled")
         self.btn_stop.pack(side="left", padx=(8, 0))
@@ -377,11 +535,12 @@ class App(tk.Tk):
 
         self.btn_options = ttk.Button(tb, text="", style="Toolbar.TButton", command=self.toggle_options)
         self.btn_options.pack(side="right")
-        self.btn_export = ttk.Button(tb, text="Export Excel", style="Toolbar.TButton", command=self.export_excel)
+        self.btn_export = ttk.Button(tb, text="Export Excel (Multi-Sheet)", style="Toolbar.TButton", command=self.export_excel)
         self.btn_export.pack(side="right", padx=(0, 8))
         self.btn_folder = ttk.Button(tb, text="Open folder", style="Toolbar.TButton", command=self.open_folder)
         self.btn_folder.pack(side="right", padx=(0, 8))
 
+        # ----- Status bar -----
         status_line = ttk.Frame(self, style="StatusLine.TFrame", height=4)
         status_line.pack(side="bottom", fill="x")
         status = ttk.Frame(self, style="Status.TFrame")
@@ -393,7 +552,8 @@ class App(tk.Tk):
         self.progress = ttk.Progressbar(status, mode="determinate")
         self.progress.pack(side="left", fill="x", expand=True, padx=(0, 6))
 
-        box = ttk.LabelFrame(self, text="Scraper Options")
+        # ----- Global Options Panel -----
+        box = ttk.LabelFrame(self, text="Global Scraper Options (Default for all sites unless overridden)")
         self.opt_box = box
         box.columnconfigure(1, weight=1)
 
@@ -408,53 +568,68 @@ class App(tk.Tk):
         opts = ttk.Frame(box)
         opts.grid(row=2, column=0, columnspan=3, sticky="w", **pad)
         ttk.Label(opts, text="Page load wait (s):").pack(side="left")
-        ttk.Spinbox(opts, from_=1, to=120, width=6, textvariable=self.var_load_wait).pack(side="left", padx=(4, 16))
+        ttk.Spinbox(opts, from_=1, to=120, width=5, textvariable=self.var_load_wait).pack(side="left", padx=(4, 14))
+        ttk.Label(opts, text="Step timeout (s):").pack(side="left")
+        ttk.Spinbox(opts, from_=1, to=120, width=5, textvariable=self.var_step_timeout).pack(side="left", padx=(4, 14))
+        ttk.Label(opts, text="Delay between steps (s):").pack(side="left")
+        ttk.Spinbox(opts, from_=0, to=60, increment=0.5, width=5, textvariable=self.var_step_delay).pack(side="left", padx=(4, 14))
         ttk.Label(opts, text="Delay between URLs (s):").pack(side="left")
-        ttk.Spinbox(opts, from_=0, to=300, increment=0.5, width=6, textvariable=self.var_url_delay).pack(side="left", padx=(4, 16))
-        ttk.Label(opts, text="Retries:").pack(side="left")
-        ttk.Spinbox(opts, from_=0, to=10, width=5, textvariable=self.var_retries).pack(side="left", padx=(4, 16))
+        ttk.Spinbox(opts, from_=0, to=300, increment=0.5, width=5, textvariable=self.var_url_delay).pack(side="left", padx=(4, 14))
         ttk.Label(opts, text="Workers (1-4):").pack(side="left")
-        ttk.Spinbox(opts, from_=1, to=4, width=5, textvariable=self.var_workers).pack(side="left", padx=(4, 0))
+        ttk.Spinbox(opts, from_=1, to=4, width=4, textvariable=self.var_workers).pack(side="left", padx=(4, 0))
 
         checks = ttk.Frame(box)
         checks.grid(row=3, column=0, columnspan=3, sticky="w", **pad)
-        ttk.Checkbutton(checks, text="Hidden Browser (Headless)", variable=self.var_headless).pack(side="left", padx=(0, 16))
-        ttk.Checkbutton(checks, text="One browser for all URLs", variable=self.var_browser_mode, onvalue="single", offvalue="each").pack(side="left", padx=(0, 16))
-        ttk.Checkbutton(checks, text="Stop loading early", variable=self.var_stop_loading).pack(side="left", padx=(0, 16))
-        ttk.Checkbutton(checks, text="Stealth mode", variable=self.var_stealth).pack(side="left", padx=(0, 16))
-        ttk.Checkbutton(checks, text="Resume previous", variable=self.var_resume).pack(side="left")
+        ttk.Checkbutton(checks, text="Hidden Browser (Headless)", variable=self.var_headless).pack(side="left", padx=(0, 14))
+        ttk.Checkbutton(checks, text="One browser per worker", variable=self.var_browser_mode, onvalue="single", offvalue="each").pack(side="left", padx=(0, 14))
+        ttk.Checkbutton(checks, text="Stop loading early", variable=self.var_stop_loading).pack(side="left", padx=(0, 14))
+        ttk.Checkbutton(checks, text="Stealth mode", variable=self.var_stealth).pack(side="left", padx=(0, 14))
+        ttk.Checkbutton(checks, text="Resume previous", variable=self.var_resume).pack(side="left", padx=(0, 14))
+        ttk.Checkbutton(checks, text="Continue if step missing", variable=self.var_continue).pack(side="left")
 
-        site_bar = ttk.Frame(self)
+        # ----- Site Profile Management Bar -----
+        site_bar = ttk.LabelFrame(self, text="Site Profile & Per-Site Customization")
         site_bar.pack(fill="x", padx=10, pady=(6, 0))
-        ttk.Label(site_bar, text="Profile for site:").pack(side="left")
-        self.cmb_set = ttk.Combobox(site_bar, state="readonly", width=26)
+        sb_in = ttk.Frame(site_bar)
+        sb_in.pack(fill="x", padx=8, pady=6)
+
+        ttk.Label(sb_in, text="Active Site:").pack(side="left")
+        self.cmb_set = ttk.Combobox(sb_in, state="readonly", width=28)
         self.cmb_set.pack(side="left", padx=(6, 6))
         self.cmb_set.bind("<<ComboboxSelected>>", self.on_set_selected)
-        ttk.Button(site_bar, text="New site...", command=self.add_site).pack(side="left")
-        ttk.Button(site_bar, text="Delete site", command=self.delete_site).pack(side="left", padx=4)
 
+        ttk.Button(sb_in, text="+ New site...", command=self.add_site).pack(side="left")
+        ttk.Button(sb_in, text="Rename site...", command=self.rename_site).pack(side="left", padx=4)
+        ttk.Button(sb_in, text="Site Options...", style="Accent.TButton", command=self.edit_site_options).pack(side="left", padx=4)
+        ttk.Button(sb_in, text="Delete site", command=self.delete_site).pack(side="left", padx=4)
+
+        self.lbl_site_info = ttk.Label(sb_in, text="", foreground="#0E8EE6")
+        self.lbl_site_info.pack(side="right", padx=8)
+
+        # ----- Main Panes -----
         pane_opts = dict(sashwidth=8, sashrelief="flat", bg="#E9ECF1", bd=0, opaqueresize=True)
         main_pane = tk.PanedWindow(self, orient="vertical", **pane_opts)
         main_pane.pack(fill="both", expand=True, padx=10, pady=4)
         mid = tk.PanedWindow(main_pane, orient="horizontal", **pane_opts)
-        main_pane.add(mid, stretch="always", minsize=220)
+        main_pane.add(mid, stretch="always", minsize=230)
 
         # 1. Links
-        links = ttk.LabelFrame(mid, text="1. Target URLs")
-        mid.add(links, stretch="always", minsize=260)
-        self.txt_links = scrolledtext.ScrolledText(links, height=10, width=35, wrap="none", **TEXT_OPTS)
+        links = ttk.LabelFrame(mid, text="1. Target URLs (Mix multiple sites freely)")
+        mid.add(links, stretch="always", minsize=280)
+        self.txt_links = scrolledtext.ScrolledText(links, height=10, width=36, wrap="none", **TEXT_OPTS)
         self.txt_links.pack(fill="both", expand=True, padx=6, pady=6)
         bar = ttk.Frame(links)
         bar.pack(fill="x", padx=6, pady=(0, 6))
         ttk.Button(bar, text="Load .txt", command=self.load_links_file).pack(side="left")
-        ttk.Button(bar, text="Clear", command=lambda: self.txt_links.delete("1.0", "end")).pack(side="left", padx=4)
+        ttk.Button(bar, text="Auto-Detect Sites", command=self.auto_detect_sites).pack(side="left", padx=4)
+        ttk.Button(bar, text="Clear", command=lambda: self.txt_links.delete("1.0", "end")).pack(side="left")
         self.lbl_count = ttk.Label(bar, text="0 links")
         self.lbl_count.pack(side="right")
         self.txt_links.bind("<<Modified>>", self.on_links_modified)
 
-        # 2. Sequential Workflow
-        seq_box = ttk.LabelFrame(mid, text="2. Sequential Workflow (Clicks & Extractions in Order)")
-        mid.add(seq_box, stretch="always", minsize=480)
+        # 2. Sequential Workflow (Supports Single & Multi-Row Repeating Elements)
+        seq_box = ttk.LabelFrame(mid, text="2. Site Workflow (Clicks & Single/Multi Extractions in Exact Order)")
+        mid.add(seq_box, stretch="always", minsize=520)
         self.lst_seq = tk.Listbox(seq_box, height=8, activestyle="none", exportselection=False, **LIST_OPTS)
         self.lst_seq.pack(fill="both", expand=True, padx=6, pady=(6, 4))
 
@@ -462,15 +637,17 @@ class App(tk.Tk):
         sr1.pack(fill="x", padx=6, pady=2)
         self.btn_rec_click = ttk.Button(sr1, text="\u25CF Record Click", command=lambda: self.toggle_record("click"))
         self.btn_rec_click.pack(side="left")
-        self.btn_rec_extract = ttk.Button(sr1, text="\u25CF Pick Extract", style="Accent.TButton", command=lambda: self.toggle_record("extract"))
+        self.btn_rec_extract = ttk.Button(sr1, text="\u25CF Pick Extract Element", style="Accent.TButton", command=lambda: self.toggle_record("extract"))
         self.btn_rec_extract.pack(side="left", padx=4)
+        ttk.Button(sr1, text="+ Manual Field", command=self.add_manual_extract).pack(side="left", padx=4)
         ttk.Button(sr1, text="+ Wait", command=self.add_wait).pack(side="left")
 
         sr2 = ttk.Frame(seq_box)
         sr2.pack(fill="x", padx=6, pady=(2, 6))
-        ttk.Button(sr2, text="Rename", command=self.rename_seq).pack(side="left")
+        ttk.Button(sr2, text="Rename Field", command=self.rename_seq).pack(side="left")
+        ttk.Button(sr2, text="Toggle Single/Multi List", command=self.toggle_multi_mode).pack(side="left", padx=4)
         ttk.Button(sr2, text="Delete", command=self.delete_seq_item).pack(side="left", padx=4)
-        ttk.Button(sr2, text="Up", width=4, command=lambda: self.move_seq(-1)).pack(side="left", padx=4)
+        ttk.Button(sr2, text="Up", width=4, command=lambda: self.move_seq(-1)).pack(side="left", padx=2)
         ttk.Button(sr2, text="Down", width=5, command=lambda: self.move_seq(1)).pack(side="left")
         ttk.Button(sr2, text="Clear", command=self.clear_seq).pack(side="right")
 
@@ -519,15 +696,25 @@ class App(tk.Tk):
             self.opt_box.pack(fill="x", padx=10, pady=(8, 0), after=self.toolbar)
         else:
             self.opt_box.pack_forget()
-        self.btn_options.config(text=f"\u2630 Options {'\u25BE' if show else '\u25B8'}")
+        self.btn_options.config(text=f"\u2630 Global Options {'\u25BE' if show else '\u25B8'}")
 
     def update_summary(self):
         extract_count = sum(1 for item in self.sequence if item["type"] == "extract")
-        headless_txt = "Hidden" if self.var_headless.get() else "Visible"
-        self.lbl_summary.config(text=f"Browser: {headless_txt}   \u00B7   Steps/Extracts: {len(self.sequence)} ({extract_count} fields)   \u00B7   Workers: {num(self.var_workers, 1)}")
+        sites_count = len([k for k in self.sequence_sets if k != ALL_SITES])
+        self.lbl_summary.config(
+            text=f"Configured Sites: {sites_count}   \u00B7   Current Steps: {len(self.sequence)} ({extract_count} fields)   \u00B7   Workers: {num(self.var_workers, 1)}"
+        )
+        if self.current_set == ALL_SITES:
+            self.lbl_site_info.config(text="Using Global Options")
+        elif self.current_set in self.site_settings:
+            self.lbl_site_info.config(text=f"Custom Options Active for [{self.current_set}]")
+        else:
+            self.lbl_site_info.config(text=f"Inheriting Global Options for [{self.current_set}]")
 
     def update_link_count(self):
-        self.lbl_count.config(text=f"{len(self.get_links())} links")
+        links = self.get_links()
+        hosts = {host_of(u) for u in links if host_of(u)}
+        self.lbl_count.config(text=f"{len(links)} links ({len(hosts)} domains)")
 
     def on_links_modified(self, _event=None):
         if self.txt_links.edit_modified():
@@ -538,6 +725,19 @@ class App(tk.Tk):
         raw = self.txt_links.get("1.0", "end").splitlines()
         links = [x.strip() for x in raw if x.strip()]
         return list(dict.fromkeys(links)) if (dedupe and self.var_dedupe.get()) else links
+
+    def auto_detect_sites(self):
+        """اكتشاف جميع المواقع الموجودة في قائمة الروابط وإضافتها تلقائياً للقائمة المنسدلة."""
+        links = self.get_links()
+        added = 0
+        for u in links:
+            h = host_of(u)
+            if h and h not in self.sequence_sets:
+                self.sequence_sets[h] = []
+                added += 1
+        self.refresh_sets()
+        self.update_summary()
+        messagebox.showinfo("Auto-Detect Sites", f"Added {added} new site profile(s) from your links.")
 
     def pick_folder(self):
         d = filedialog.askdirectory(title="Choose save folder")
@@ -565,36 +765,69 @@ class App(tk.Tk):
 
     def export_excel(self):
         folder = self.var_folder.get().strip()
-        tsv_path = os.path.join(folder, "Sequential_Scraped_Data.txt") if folder else ""
-        if not tsv_path or not os.path.exists(tsv_path):
+        json_path = os.path.join(folder, "Scraped_Results.jsonl") if folder else ""
+        if not json_path or not os.path.exists(json_path):
             messagebox.showinfo("Export Excel", "No scraped data found yet.")
             return
-        rows = []
-        with open(tsv_path, encoding="utf-8") as f:
-            for line in f:
-                if line.strip():
-                    rows.append(line.rstrip("\n").split("\t"))
-        path = os.path.join(folder, "Extracted_Data.xlsx")
-        try:
-            write_xlsx(path, rows)
-            open_file(path)
-        except Exception as e:
-            messagebox.showerror("Export Excel", f"Error:\n{e}")
 
+        by_site = {}
+        with open(json_path, encoding="utf-8") as f:
+            for line in f:
+                if not line.strip():
+                    continue
+                rec = json.loads(line)
+                site_key = rec.get("site_profile", "General")
+                by_site.setdefault(site_key, []).append(rec)
+
+        sheets_dict = {}
+        for site_key, records in by_site.items():
+            # جمع أسماء الأعمدة الخاصة بهذا الموقع بالترتيب
+            field_names = []
+            for r in records:
+                for k in r.get("fields", {}).keys():
+                    if k not in field_names:
+                        field_names.append(k)
+
+            header = ["Page Link", "Page Title", "Row #", "Status", "Notes", "Timestamp"] + field_names
+            rows = [header]
+            for r in records:
+                fdict = r.get("fields", {})
+                row = [
+                    r.get("link", ""),
+                    r.get("title", ""),
+                    r.get("row_index", 1),
+                    r.get("status", ""),
+                    r.get("notes", ""),
+                    r.get("timestamp", ""),
+                ] + [fdict.get(fn, "") for fn in field_names]
+                rows.append(row)
+            sheets_dict[site_key] = rows
+
+        out_xlsx = os.path.join(folder, "MultiSite_Extracted_Data.xlsx")
+        try:
+            write_multi_sheet_xlsx(out_xlsx, sheets_dict)
+            self.log(f"Exported multi-sheet Excel: {out_xlsx}")
+            open_file(out_xlsx)
+        except Exception as e:
+            messagebox.showerror("Export Excel", f"Error writing Excel:\n{e}")
+
+    # ----- Site Profiles & Per-Site Options -----
     def refresh_sets(self):
-        keys = [ALL_SITES] + sorted(set(self.sequence_sets) - {ALL_SITES})
+        keys = [ALL_SITES] + sorted((set(self.sequence_sets) | set(self.site_settings)) - {ALL_SITES})
         self.cmb_set.config(values=[ALL_SITES_LABEL if k == ALL_SITES else k for k in keys])
         self.cmb_set.set(ALL_SITES_LABEL if self.current_set == ALL_SITES else self.current_set)
+        self.update_summary()
 
     def on_set_selected(self, _event=None):
         label = self.cmb_set.get()
         self.current_set = ALL_SITES if label == ALL_SITES_LABEL else label
         self.refresh_sequence()
+        self.update_summary()
 
     def add_site(self):
         links = self.get_links()
-        first = host_of(links[0]) if links else ""
-        text = simpledialog.askstring("New site", "Domain name:", initialvalue=first, parent=self)
+        first = next((host_of(u) for u in links if host_of(u) not in self.sequence_sets), "")
+        text = simpledialog.askstring("New Site Profile", "Enter domain name (e.g. st.com, ti.com):", initialvalue=first, parent=self)
         host = host_of(text.strip()) if text else ""
         if host:
             self.sequence_sets.setdefault(host, [])
@@ -602,27 +835,147 @@ class App(tk.Tk):
             self.refresh_sets()
             self.refresh_sequence()
 
+    def rename_site(self):
+        if self.current_set == ALL_SITES:
+            messagebox.showinfo("Rename Site", "Cannot rename 'All sites (default)'. Select a specific site first.")
+            return
+        old_host = self.current_set
+        new_text = simpledialog.askstring("Rename Site", "Enter new domain / profile name:", initialvalue=old_host, parent=self)
+        new_host = host_of(new_text.strip()) if new_text else ""
+        if not new_host or new_host == old_host:
+            return
+        if new_host in self.sequence_sets:
+            messagebox.showwarning("Rename Site", f"A profile named '{new_host}' already exists.")
+            return
+        self.sequence_sets[new_host] = self.sequence_sets.pop(old_host, [])
+        if old_host in self.site_settings:
+            self.site_settings[new_host] = self.site_settings.pop(old_host)
+        self.current_set = new_host
+        self.refresh_sets()
+        self.refresh_sequence()
+        self.log(f"Site renamed: {old_host} -> {new_host}")
+
     def delete_site(self):
-        if self.current_set != ALL_SITES and messagebox.askyesno("Delete site", f"Delete profile for {self.current_set}?"):
+        if self.current_set != ALL_SITES and messagebox.askyesno("Delete Site", f"Delete profile and settings for '{self.current_set}'?"):
             self.sequence_sets.pop(self.current_set, None)
+            self.site_settings.pop(self.current_set, None)
             self.current_set = ALL_SITES
             self.refresh_sets()
             self.refresh_sequence()
 
+    def edit_site_options(self):
+        """نافذة تخصيص الإعدادات (Options) المستقلة لكل موقع على حدة."""
+        if self.current_set == ALL_SITES:
+            messagebox.showinfo("Site Options", "Select a specific site first (or click '+ New site...') to customize its options.")
+            return
+        host = self.current_set
+        cur = self.site_settings.get(host, {})
+
+        dlg = tk.Toplevel(self)
+        dlg.title(f"Custom Options for: {host}")
+        dlg.transient(self)
+        dlg.configure(bg=BG)
+        dlg.resizable(False, False)
+
+        v_use = tk.BooleanVar(value=host in self.site_settings)
+        v_load = tk.IntVar(value=cur.get("load_wait", num(self.var_load_wait, 5)))
+        v_tout = tk.DoubleVar(value=cur.get("step_timeout", num(self.var_step_timeout, 10)))
+        v_sdel = tk.DoubleVar(value=cur.get("step_delay", num(self.var_step_delay, 1)))
+        v_udel = tk.DoubleVar(value=cur.get("url_delay", num(self.var_url_delay, 0)))
+        v_head = tk.BooleanVar(value=cur.get("headless", self.var_headless.get()))
+        v_stel = tk.BooleanVar(value=cur.get("stealth", self.var_stealth.get()))
+        v_stop = tk.BooleanVar(value=cur.get("stop_loading", self.var_stop_loading.get()))
+        v_newb = tk.BooleanVar(value=cur.get("new_browser", self.var_browser_mode.get() == "each"))
+
+        pad = {"padx": 12, "pady": 4}
+        ttk.Checkbutton(dlg, text=f"Enable custom options for [{host}]", variable=v_use).grid(row=0, column=0, columnspan=2, sticky="w", padx=12, pady=(10, 6))
+
+        ttk.Label(dlg, text="Page load wait (s):").grid(row=1, column=0, sticky="w", **pad)
+        ttk.Spinbox(dlg, from_=1, to=120, width=8, textvariable=v_load).grid(row=1, column=1, sticky="w", **pad)
+
+        ttk.Label(dlg, text="Step element timeout (s):").grid(row=2, column=0, sticky="w", **pad)
+        ttk.Spinbox(dlg, from_=1, to=120, width=8, textvariable=v_tout).grid(row=2, column=1, sticky="w", **pad)
+
+        ttk.Label(dlg, text="Delay between steps (s):").grid(row=3, column=0, sticky="w", **pad)
+        ttk.Spinbox(dlg, from_=0, to=60, increment=0.5, width=8, textvariable=v_sdel).grid(row=3, column=1, sticky="w", **pad)
+
+        ttk.Label(dlg, text="Delay between URLs (s):").grid(row=4, column=0, sticky="w", **pad)
+        ttk.Spinbox(dlg, from_=0, to=300, increment=0.5, width=8, textvariable=v_udel).grid(row=4, column=1, sticky="w", **pad)
+
+        ttk.Checkbutton(dlg, text="Hidden Browser (Headless)", variable=v_head).grid(row=5, column=0, columnspan=2, sticky="w", **pad)
+        ttk.Checkbutton(dlg, text="Stealth Mode (Anti-Bot)", variable=v_stel).grid(row=6, column=0, columnspan=2, sticky="w", **pad)
+        ttk.Checkbutton(dlg, text="Stop loading early", variable=v_stop).grid(row=7, column=0, columnspan=2, sticky="w", **pad)
+        ttk.Checkbutton(dlg, text="Reopen fresh browser for every URL", variable=v_newb).grid(row=8, column=0, columnspan=2, sticky="w", **pad)
+
+        def save_site_opts():
+            if not v_use.get():
+                self.site_settings.pop(host, None)
+            else:
+                self.site_settings[host] = {
+                    "load_wait": int(v_load.get()),
+                    "step_timeout": float(v_tout.get()),
+                    "step_delay": float(v_sdel.get()),
+                    "url_delay": float(v_udel.get()),
+                    "headless": bool(v_head.get()),
+                    "stealth": bool(v_stel.get()),
+                    "stop_loading": bool(v_stop.get()),
+                    "new_browser": bool(v_newb.get()),
+                }
+            dlg.destroy()
+            self.update_summary()
+
+        btns = ttk.Frame(dlg)
+        btns.grid(row=9, column=0, columnspan=2, sticky="e", padx=12, pady=10)
+        ttk.Button(btns, text="Save", style="Accent.TButton", command=save_site_opts).pack(side="left")
+        ttk.Button(btns, text="Cancel", command=dlg.destroy).pack(side="left", padx=6)
+        dlg.grab_set()
+
+    # ----- Sequence List UI -----
     def refresh_sequence(self, select=None):
         self.lst_seq.delete(0, "end")
         for n, item in enumerate(self.sequence, 1):
             t = item["type"]
             if t == "wait":
-                txt = f"{n}. [WAIT] {item['seconds']:g} seconds"
+                txt = f"{n}. [WAIT] {item['seconds']:g} s"
             elif t == "click":
-                txt = f"{n}. [CLICK STEP] -> {item['selector']}"
+                txt = f"{n}. [CLICK] -> {item['selector']}"
             elif t == "extract":
-                txt = f"{n}. [EXTRACT FIELD: {item['name']}] -> {item['selector']}"
+                mode_tag = "MULTI-ROWS LIST" if item.get("multi") else "SINGLE VALUE"
+                txt = f"{n}. [EXTRACT ({mode_tag}): {item['name']}] -> {item['selector']}"
             self.lst_seq.insert("end", txt)
         if select is not None and 0 <= select < len(self.sequence):
             self.lst_seq.selection_set(select)
         self.update_summary()
+
+    def toggle_multi_mode(self):
+        sel = self.lst_seq.curselection()
+        if not sel:
+            return
+        idx = sel[0]
+        item = self.sequence[idx]
+        if item["type"] != "extract":
+            messagebox.showinfo("Info", "Select an Extract field first.")
+            return
+        item["multi"] = not item.get("multi", False)
+        if item["multi"] and item.get("multi_selector"):
+            item["selector"], item["multi_selector"] = item["multi_selector"], item["selector"]
+        self.refresh_sequence(select=idx)
+
+    def add_manual_extract(self):
+        name = simpledialog.askstring("Field Name", "Column Name (e.g. Part Number, Status):", parent=self)
+        if not name or not name.strip():
+            return
+        sel = simpledialog.askstring("Selector", f"CSS or xpath= selector for '{name.strip()}':", parent=self)
+        if not sel or not sel.strip():
+            return
+        is_multi = messagebox.askyesno("Extraction Mode", "Does this selector match MULTIPLE repeating items (rows) on the same page?")
+        self.sequence.append({
+            "type": "extract",
+            "name": name.strip(),
+            "selector": sel.strip(),
+            "multi": is_multi,
+        })
+        self.refresh_sequence(select=len(self.sequence) - 1)
 
     def delete_seq_item(self):
         sel = self.lst_seq.curselection()
@@ -641,7 +994,7 @@ class App(tk.Tk):
             self.refresh_sequence(select=j)
 
     def clear_seq(self):
-        if self.sequence and messagebox.askyesno("Clear", "Remove all workflow steps?"):
+        if self.sequence and messagebox.askyesno("Clear", "Remove all steps in this profile?"):
             self.sequence = []
             self.refresh_sequence()
 
@@ -662,15 +1015,17 @@ class App(tk.Tk):
             if new_name and new_name.strip():
                 item["name"] = new_name.strip()
                 self.refresh_sequence(select=idx)
-        else:
-            messagebox.showinfo("Info", "Only Extract fields can be renamed.")
 
+    # ----- Visual Picker -----
     def toggle_record(self, mode):
         if self.rec_mode is not None:
             self.rec_stop.set()
             return
         links = self.get_links()
-        url = links[0] if links else simpledialog.askstring("Sample URL", "Enter URL to open:", parent=self)
+        if self.current_set != ALL_SITES:
+            url = next((u for u in links if host_matches(host_of(u), self.current_set)), "https://" + self.current_set)
+        else:
+            url = links[0] if links else simpledialog.askstring("Sample URL", "Enter URL to open:", parent=self)
         if not url:
             return
 
@@ -679,11 +1034,9 @@ class App(tk.Tk):
         if mode == "click":
             self.btn_rec_click.config(text="\u25A0 Stop Click Rec")
             self.btn_rec_extract.config(state="disabled")
-            self.log("MODE: Recording Click Action...")
         else:
-            self.btn_rec_extract.config(text="\u25A0 Stop Extract Pick")
+            self.btn_rec_extract.config(text="\u25A0 Stop Picking")
             self.btn_rec_click.config(state="disabled")
-            self.log("MODE: Picking Extract Field (Hover & Click)...")
 
         threading.Thread(target=self.record_worker, args=(url, mode, self.var_driver.get().strip(), self.var_stealth.get()), daemon=True).start()
 
@@ -758,23 +1111,41 @@ class App(tk.Tk):
                     if m == "click":
                         self.sequence.append({"type": "click", "selector": data["selector"]})
                         self.refresh_sequence(select=len(self.sequence) - 1)
-                        self.log(f"[Recorded Click Step]: {data['selector']}")
+                        self.log(f"[{self.current_set}] Recorded Click: {data['selector']}")
                     elif m == "extract":
                         extract_count = sum(1 for item in self.sequence if item["type"] == "extract")
                         col_name = f"Field_{extract_count + 1}"
+                        multi_count = data.get("multi_count", 1)
+                        use_multi = False
+                        chosen_sel = data["selector"]
+                        alt_sel = data.get("multi_selector", chosen_sel)
+
+                        if multi_count > 1:
+                            ans = messagebox.askyesno(
+                                "Repeating Element Detected",
+                                f"Found {multi_count} similar repeating items on this page!\n\n"
+                                f"Sample: '{data.get('sample', '')}'\n\n"
+                                f"Do you want to extract ALL {multi_count} items as separate rows (Multi-Row List)?\n"
+                                f"(Click 'No' to extract only this single element)"
+                            )
+                            if ans:
+                                use_multi = True
+                                chosen_sel, alt_sel = alt_sel, chosen_sel
+
                         self.sequence.append({
                             "type": "extract",
                             "name": col_name,
-                            "selector": data["selector"],
-                            "sample": data.get("sample", "")
+                            "selector": chosen_sel,
+                            "multi_selector": alt_sel,
+                            "multi": use_multi,
+                            "sample": data.get("sample", ""),
                         })
                         self.refresh_sequence(select=len(self.sequence) - 1)
-                        self.log(f"[Recorded Extract Field]: {col_name} -> {data['selector']} (Sample: {data.get('sample', '')})")
+                        self.log(f"[{self.current_set}] Picked {col_name} ({'Multi-Row' if use_multi else 'Single'}): {chosen_sel}")
                 elif kind == "rec_done":
                     self.rec_mode = None
                     self.btn_rec_click.config(text="\u25CF Record Click", state="normal")
-                    self.btn_rec_extract.config(text="\u25CF Pick Extract", state="normal")
-                    self.log("Visual session closed.")
+                    self.btn_rec_extract.config(text="\u25CF Pick Extract Element", state="normal")
         except queue.Empty:
             pass
         self.after(100, self.poll_queue)
@@ -791,6 +1162,7 @@ class App(tk.Tk):
                     pass
         self.destroy()
 
+    # ----- Execution Engine -----
     def build_cfg(self):
         folder = self.var_folder.get().strip()
         links = self.get_links()
@@ -808,6 +1180,7 @@ class App(tk.Tk):
             "after_steps": num(self.var_after_steps, 2),
             "continue_missing": self.var_continue.get(),
             "sequence_sets": json.loads(json.dumps(self.sequence_sets)),
+            "site_settings": json.loads(json.dumps(self.site_settings)),
             "new_browser": self.var_browser_mode.get() == "each",
             "headless": self.var_headless.get(),
             "stealth": self.var_stealth.get(),
@@ -846,17 +1219,17 @@ class App(tk.Tk):
 
     def run_test(self, link, cfg):
         q = self.msg_queue
-        q.put(("log", f"TEST scraping: {link}"))
+        site_key = resolve_site_key(cfg["sequence_sets"], link)
+        scfg = apply_site_cfg(cfg, link)
+        seq = cfg["sequence_sets"].get(site_key, [])
+        q.put(("log", f"TEST [{site_key}] on: {link}"))
         driver = None
         try:
-            driver = self.new_driver(cfg)
-            seq = steps_for_url(cfg["sequence_sets"], link)
-            page_title, vals, status, note = self.execute_sequence(driver, link, cfg, seq)
-            q.put(("log", f"   Page Title: {page_title}"))
-            q.put(("log", f"   Status: {status} {note}"))
-            extract_fields = [item for item in seq if item["type"] == "extract"]
-            for f, v in zip(extract_fields, vals):
-                q.put(("log", f"   [{f['name']}]: {v}"))
+            driver = self.new_driver(scfg)
+            page_title, rows_data, status, note = self.execute_sequence(driver, link, scfg, seq)
+            q.put(("log", f"   Page Title: {page_title} | Extracted Rows: {len(rows_data)}"))
+            for r_idx, fdict in enumerate(rows_data[:10], 1):
+                q.put(("log", f"   Row {r_idx}: {json.dumps(fdict, ensure_ascii=False)}"))
         except Exception as e:
             q.put(("log", f"   Error: {e}"))
         finally:
@@ -866,17 +1239,17 @@ class App(tk.Tk):
         self.stop_event.set()
         self.msg_queue.put(("log", "Stopping..."))
 
-    def new_driver(self, cfg):
+    def new_driver(self, scfg):
         options = webdriver.ChromeOptions()
         options.page_load_strategy = "none"
         options.add_argument("--start-maximized")
-        if cfg.get("headless"):
+        if scfg.get("headless"):
             options.add_argument("--headless=new")
             options.add_argument("--window-size=1920,1080")
-        if cfg.get("stealth"):
+        if scfg.get("stealth"):
             apply_stealth_options(options)
-        driver = webdriver.Chrome(service=make_service(cfg["driver"]), options=options)
-        if cfg.get("stealth"):
+        driver = webdriver.Chrome(service=make_service(scfg["driver"]), options=options)
+        if scfg.get("stealth"):
             apply_stealth_driver(driver)
         self.live_drivers.add(driver)
         return driver
@@ -889,14 +1262,20 @@ class App(tk.Tk):
             except Exception:
                 pass
 
-    def execute_sequence(self, driver, link, cfg, sequence):
+    def execute_sequence(self, driver, link, scfg, sequence):
+        """
+        ينفذ الخطوات بالترتيب ويدعم:
+        - حقول مفردة (Single Value)
+        - قوائم متكررة (Multi-Row List) مثل 20 Part Number + 20 Status في نفس الصفحة
+        """
         driver.get(link)
-        time.sleep(cfg["load_wait"])
-        if cfg["stop_loading"]:
+        time.sleep(scfg["load_wait"])
+        if scfg["stop_loading"]:
             driver.execute_script("window.stop();")
 
         page_title = driver.title.strip()
-        extracted_values = []
+        single_fields = {}
+        multi_fields = {}  # {field_name: [val1, val2, ...]}
 
         for item in sequence:
             t = item["type"]
@@ -905,11 +1284,11 @@ class App(tk.Tk):
             elif t == "click":
                 by, val = parse_selector(item["selector"])
                 try:
-                    els = WebDriverWait(driver, cfg["step_timeout"]).until(lambda d: d.find_elements(by, val) or False)
+                    els = WebDriverWait(driver, scfg["step_timeout"]).until(lambda d: d.find_elements(by, val) or False)
                 except TimeoutException:
                     els = []
                 if not els:
-                    if cfg["continue_missing"]:
+                    if scfg["continue_missing"]:
                         continue
                     raise RuntimeError(f"Element not found for click: {item['selector']}")
                 visible = [e for e in els if is_displayed(e)] or els
@@ -918,38 +1297,63 @@ class App(tk.Tk):
                         click_element(driver, el)
                     except Exception:
                         pass
-                time.sleep(cfg["step_delay"])
+                time.sleep(scfg["step_delay"])
             elif t == "extract":
                 by, val = parse_selector(item["selector"])
                 try:
                     els = driver.find_elements(by, val)
                     texts = [e.text.strip() for e in els if e.text.strip()]
-                    extracted_values.append(" | ".join(texts) if texts else "")
                 except Exception:
-                    extracted_values.append("")
+                    texts = []
 
-        return page_title, extracted_values, "OK", ""
+                if item.get("multi"):
+                    multi_fields[item["name"]] = texts
+                else:
+                    single_fields[item["name"]] = " | ".join(texts) if texts else ""
 
-    def worker_loop(self, task_q, cfg, ctx, active_sequence):
-        holder = {"d": None}
-        extract_fields = [item for item in active_sequence if item["type"] == "extract"]
-        
+        # دمج القوائم المتكررة في صفوف متوازية (Row 1, Row 2, ...)
+        max_rows = max((len(v) for v in multi_fields.values()), default=1)
+        max_rows = max(1, max_rows)
+
+        rows_output = []
+        for idx in range(max_rows):
+            row_dict = dict(single_fields)
+            for fname, vlist in multi_fields.items():
+                row_dict[fname] = vlist[idx] if idx < len(vlist) else ""
+            rows_output.append(row_dict)
+
+        return page_title, rows_output, "OK", ""
+
+    def worker_loop(self, task_q, cfg, ctx):
+        holder = {"d": None, "sig": None}
         try:
             while not self.stop_event.is_set():
                 try:
                     i, link = task_q.get_nowait()
                 except queue.Empty:
                     break
-                self.msg_queue.put(("log", f"Scraping [{i + 1}/{ctx['total']}]: {link}"))
-                
-                page_title, vals, status, note = "", [""] * len(extract_fields), "Error", ""
+
+                site_key = resolve_site_key(cfg["sequence_sets"], link)
+                scfg = apply_site_cfg(cfg, link)
+                seq = cfg["sequence_sets"].get(site_key, [])
+                driver_sig = (scfg.get("headless"), scfg.get("stealth"))
+
+                # إعادة إنشاء المتصفح إذا تغيرت إعدادات الموقع التالي (مثلاً موقع يحتاج Stealth وموقع لا)
+                if holder["d"] is not None and holder["sig"] != driver_sig:
+                    self.close_driver(holder["d"])
+                    holder["d"] = None
+
+                self.msg_queue.put(("log", f"[{i + 1}/{ctx['total']}] ({site_key}) {link}"))
+
+                page_title, rows_data, status, note = "", [{}], "Error", ""
                 for attempt in range(1, cfg["retries"] + 2):
                     if self.stop_event.is_set():
                         break
                     try:
                         if holder["d"] is None:
-                            holder["d"] = self.new_driver(cfg)
-                        page_title, vals, status, note = self.execute_sequence(holder["d"], link, cfg, active_sequence)
+                            holder["d"] = self.new_driver(scfg)
+                            holder["sig"] = driver_sig
+                        page_title, rows_data, status, note = self.execute_sequence(holder["d"], link, scfg, seq)
                         break
                     except Exception as e:
                         note = str(e).splitlines()[0] if str(e) else type(e).__name__
@@ -959,37 +1363,54 @@ class App(tk.Tk):
                     if attempt <= cfg["retries"] and not self.stop_event.is_set():
                         time.sleep(2)
 
-                row = [link, page_title, status, note, datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")] + vals
+                if scfg.get("new_browser") and holder["d"]:
+                    self.close_driver(holder["d"])
+                    holder["d"] = None
+
+                ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 with ctx["lock"]:
-                    ctx["out"].write(tsv(row))
+                    for r_idx, fdict in enumerate(rows_data, 1):
+                        rec = {
+                            "site_profile": site_key if site_key != ALL_SITES else (host_of(link) or "General"),
+                            "link": link,
+                            "title": page_title,
+                            "row_index": r_idx,
+                            "status": status,
+                            "notes": note,
+                            "timestamp": ts,
+                            "fields": fdict,
+                        }
+                        ctx["out"].write(json.dumps(rec, ensure_ascii=False) + "\n")
                     ctx["out"].flush()
                     ctx["done"] += 1
                     self.msg_queue.put(("progress", (ctx["done"], ctx["total"])))
+
+                if scfg.get("url_delay", 0) > 0 and not self.stop_event.is_set():
+                    time.sleep(scfg["url_delay"])
         finally:
             self.close_driver(holder["d"])
 
     def run_job(self, links, cfg):
         q = self.msg_queue
         total = len(links)
-        out_path = os.path.join(cfg["folder"], "Sequential_Scraped_Data.txt")
-        
-        active_sequence = steps_for_url(cfg["sequence_sets"], links[0])
-        extract_fields = [item for item in active_sequence if item["type"] == "extract"]
-        
-        header = ["Page Link", "Page Title", "Status", "Notes", "Timestamp"] + [f["name"] for f in extract_fields]
+        out_path = os.path.join(cfg["folder"], "Scraped_Results.jsonl")
 
         done_links = set()
         if cfg["resume"] and os.path.exists(out_path):
             with open(out_path, encoding="utf-8") as f:
                 for line in f:
-                    parts = line.split("\t")
-                    if len(parts) > 2 and parts[2] == "OK":
-                        done_links.add(parts[0])
+                    if not line.strip():
+                        continue
+                    try:
+                        rec = json.loads(line)
+                        if rec.get("status") == "OK":
+                            done_links.add(rec.get("link"))
+                    except Exception:
+                        pass
 
         todo = [(i, l) for i, l in enumerate(links) if l not in done_links]
         if not os.path.exists(out_path) or not cfg["resume"]:
-            with open(out_path, "w", encoding="utf-8") as f:
-                f.write(tsv(header))
+            open(out_path, "w", encoding="utf-8").close()
 
         ctx = {"lock": threading.Lock(), "done": total - len(todo), "total": total}
         q.put(("progress", (ctx["done"], total)))
@@ -1001,12 +1422,15 @@ class App(tk.Tk):
         n_workers = max(1, min(cfg["workers"], len(todo))) if todo else 0
         with open(out_path, "a", encoding="utf-8") as out:
             ctx["out"] = out
-            threads = [threading.Thread(target=self.worker_loop, args=(task_q, cfg, ctx, active_sequence), daemon=True) for _ in range(n_workers)]
-            for t in threads: t.start()
-            for t in threads: t.join()
+            threads = [threading.Thread(target=self.worker_loop, args=(task_q, cfg, ctx), daemon=True) for _ in range(n_workers)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
 
-        q.put(("log", f"Scraping finished! Saved to: {out_path}"))
+        q.put(("log", f"Multi-site scraping finished! Click 'Export Excel (Multi-Sheet)' to view organized tabs."))
         q.put(("done", None))
+
 
 if __name__ == "__main__":
     App().mainloop()
