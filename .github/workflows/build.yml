@@ -29,7 +29,7 @@ jobs:
 
       - uses: actions/upload-artifact@v4
         with:
-          name: WebToPDF
+          name: AEWEBSCRAPPER
           path: dist/AEWEBSCRAPPER.exe
 
       - name: Publish release (tags only)
