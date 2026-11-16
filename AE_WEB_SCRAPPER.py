@@ -29,7 +29,6 @@ BORDER = "#D9D9D9"
 TEXT = "#2B2B2B"
 GREEN_BG = "#E3F4D7"
 GREEN = "#62C93F"
-ORANGE = "#FF8C00"
 
 TEXT_OPTS = dict(
     relief="flat", borderwidth=0, highlightthickness=1,
@@ -43,12 +42,10 @@ LIST_OPTS = dict(
     bg="white", fg=TEXT, selectbackground=BLUE, selectforeground="white",
 )
 
-# سكريبت مشترك يدعم وضعين: 'click' لتسجيل الخطوات، و 'extract' لالتقاط العناصر بدون تنفيذ النقر
 REC_JS = r"""
 (function () {
   if (window.__recInstalled) return;
   window.__recInstalled = true;
-  window.__recMode = window.__recMode || 'click';
 
   function uniq(sel) {
     try { return document.querySelectorAll(sel).length === 1; } catch (e) { return false; }
@@ -100,7 +97,6 @@ REC_JS = r"""
     return parts.join(' > ');
   }
 
-  // تمييز العنصر بصرياً عند تمرير الماوس في وضع الاستخراج
   var lastHovered = null;
   document.addEventListener('mouseover', function (e) {
     if (window.__recMode !== 'extract') return;
@@ -111,10 +107,8 @@ REC_JS = r"""
 
   document.addEventListener('click', function (e) {
     try {
-      var mode = window.__recMode;
-      var t = (mode === 'click')
-        ? (e.target.closest('a,button,input,select,label,summary,[role=button],[role=tab],[onclick]') || e.target)
-        : e.target;
+      var mode = window.__recMode || 'click';
+      var t = e.target;
 
       if (mode === 'extract') {
         e.preventDefault();
@@ -124,7 +118,7 @@ REC_JS = r"""
 
       var sampleText = (t.innerText || t.value || t.getAttribute('aria-label') || '').trim().replace(/\s+/g, ' ').slice(0, 40);
       var data = {
-        mode: mode,
+        type: mode,
         selector: buildSelector(t),
         sample: sampleText
       };
@@ -193,11 +187,11 @@ def num(var, default):
 
 ALL_SITES = "*"
 ALL_SITES_LABEL = "All sites (default)"
-APP_VERSION = "2.2.0-visual-scraper"
+APP_VERSION = "2.4.0-headless-sequence"
 
 def settings_file():
     base = os.environ.get("APPDATA") or os.path.join(os.path.expanduser("~"), ".config")
-    return os.path.join(base, "WebScraperTool", "settings_v2.json")
+    return os.path.join(base, "WebScraperTool", "settings_v4.json")
 
 def host_of(url):
     try:
@@ -212,7 +206,7 @@ def host_matches(host, key):
         key = key[4:]
     return bool(key) and (host == key or host.endswith("." + key))
 
-def items_for_url(sets_dict, url):
+def steps_for_url(sets_dict, url):
     host = host_of(url)
     best = None
     for key in sets_dict:
@@ -259,7 +253,7 @@ def write_xlsx(path, rows):
     parts = {
         "[Content_Types].xml": head + '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/><Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/><Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/></Types>',
         "_rels/.rels": head + f'<Relationships xmlns="{ns_pkg}"><Relationship Id="rId1" Type="{ns_rel}/officeDocument" Target="xl/workbook.xml"/></Relationships>',
-        "xl/workbook.xml": head + f'<workbook xmlns="{ns_main}" xmlns:r="{ns_rel}"><sheets><sheet name="Extracted Data" sheetId="1" r:id="rId1"/></sheets></workbook>',
+        "xl/workbook.xml": head + f'<workbook xmlns="{ns_main}" xmlns:r="{ns_rel}"><sheets><sheet name="Sequential Data" sheetId="1" r:id="rId1"/></sheets></workbook>',
         "xl/_rels/workbook.xml.rels": head + f'<Relationships xmlns="{ns_pkg}"><Relationship Id="rId1" Type="{ns_rel}/worksheet" Target="worksheets/sheet1.xml"/><Relationship Id="rId2" Type="{ns_rel}/styles" Target="styles.xml"/></Relationships>',
         "xl/styles.xml": head + f'<styleSheet xmlns="{ns_main}"><fonts count="2"><font><sz val="11"/><name val="Calibri"/></font><font><b/><sz val="11"/><name val="Calibri"/></font></fonts><fills count="2"><fill><patternFill patternType="none"/></fill><fill><patternFill patternType="gray125"/></fill></fills><borders count="1"><border><left/><right/><top/><bottom/><diagonal/></border></borders><cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs><cellXfs count="2"><xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/><xf numFmtId="0" fontId="1" fillId="0" borderId="0" xfId="0" applyFont="1"/></cellXfs><cellStyles count="1"><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles></styleSheet>',
         "xl/worksheets/sheet1.xml": "".join(sheet),
@@ -271,7 +265,7 @@ def write_xlsx(path, rows):
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title(f"Visual Web Scraper Pro  v{APP_VERSION}")
+        self.title(f"Sequential Web Scraper Pro  v{APP_VERSION}")
         self.geometry("1120x800")
         self.minsize(960, 680)
 
@@ -279,13 +273,12 @@ class App(tk.Tk):
         self.stop_event = threading.Event()
         self.rec_stop = threading.Event()
         self.worker = None
-        self.rec_mode = None  # None | 'click' | 'extract'
+        self.rec_mode = None
         self.rec_driver = None
         self.live_drivers = set()
         self.opt_visible = False
 
-        self.step_sets = {ALL_SITES: []}
-        self.extract_sets = {ALL_SITES: []}
+        self.sequence_sets = {ALL_SITES: []}
         self.current_set = ALL_SITES
         self.saved_links = ""
 
@@ -295,6 +288,7 @@ class App(tk.Tk):
         self.var_stop_loading = tk.BooleanVar(value=True)
         self.var_dedupe = tk.BooleanVar(value=True)
         self.var_browser_mode = tk.StringVar(value="single")
+        self.var_headless = tk.BooleanVar(value=True)  # مفعل افتراضياً للعمل في الخلفية بصمت
         self.var_stealth = tk.BooleanVar(value=False)
         self.var_url_delay = tk.DoubleVar(value=0)
         self.var_step_timeout = tk.DoubleVar(value=10)
@@ -309,11 +303,11 @@ class App(tk.Tk):
             "folder": self.var_folder, "driver": self.var_driver,
             "load_wait": self.var_load_wait, "stop_loading": self.var_stop_loading,
             "dedupe": self.var_dedupe, "browser_mode": self.var_browser_mode,
-            "stealth": self.var_stealth, "url_delay": self.var_url_delay,
-            "step_timeout": self.var_step_timeout, "step_delay": self.var_step_delay,
-            "after_steps": self.var_after_steps, "continue": self.var_continue,
-            "retries": self.var_retries, "workers": self.var_workers,
-            "resume": self.var_resume,
+            "headless": self.var_headless, "stealth": self.var_stealth,
+            "url_delay": self.var_url_delay, "step_timeout": self.var_step_timeout,
+            "step_delay": self.var_step_delay, "after_steps": self.var_after_steps,
+            "continue": self.var_continue, "retries": self.var_retries,
+            "workers": self.var_workers, "resume": self.var_resume,
         }
         self.load_settings()
         self.build_ui()
@@ -324,20 +318,12 @@ class App(tk.Tk):
         self.after(100, self.poll_queue)
 
     @property
-    def steps(self):
-        return self.step_sets.setdefault(self.current_set, [])
+    def sequence(self):
+        return self.sequence_sets.setdefault(self.current_set, [])
 
-    @steps.setter
-    def steps(self, value):
-        self.step_sets[self.current_set] = value
-
-    @property
-    def extracts(self):
-        return self.extract_sets.setdefault(self.current_set, [])
-
-    @extracts.setter
-    def extracts(self, value):
-        self.extract_sets[self.current_set] = value
+    @sequence.setter
+    def sequence(self, value):
+        self.sequence_sets[self.current_set] = value
 
     def load_settings(self):
         try:
@@ -353,21 +339,17 @@ class App(tk.Tk):
                     var.set(data[key])
                 except Exception:
                     pass
-        if isinstance(data.get("step_sets"), dict):
-            self.step_sets = data["step_sets"]
-            self.step_sets.setdefault(ALL_SITES, [])
-        if isinstance(data.get("extract_sets"), dict):
-            self.extract_sets = data["extract_sets"]
-            self.extract_sets.setdefault(ALL_SITES, [])
-        if data.get("current_set") in (set(self.step_sets) | set(self.extract_sets)):
+        if isinstance(data.get("sequence_sets"), dict):
+            self.sequence_sets = data["sequence_sets"]
+            self.sequence_sets.setdefault(ALL_SITES, [])
+        if data.get("current_set") in self.sequence_sets:
             self.current_set = data["current_set"]
         if isinstance(data.get("links"), str):
             self.saved_links = data["links"]
 
     def save_settings(self):
         data = {key: var.get() for key, var in self.persist.items() if hasattr(var, "get")}
-        data["step_sets"] = self.step_sets
-        data["extract_sets"] = self.extract_sets
+        data["sequence_sets"] = self.sequence_sets
         data["current_set"] = self.current_set
         data["links"] = self.txt_links.get("1.0", "end").strip()
         try:
@@ -382,7 +364,6 @@ class App(tk.Tk):
         self.apply_theme()
         pad = {"padx": 8, "pady": 4}
 
-        # ----- Toolbar -----
         self.toolbar = ttk.Frame(self, style="Toolbar.TFrame")
         self.toolbar.pack(side="top", fill="x")
         tb = ttk.Frame(self.toolbar, style="Toolbar.TFrame")
@@ -401,7 +382,6 @@ class App(tk.Tk):
         self.btn_folder = ttk.Button(tb, text="Open folder", style="Toolbar.TButton", command=self.open_folder)
         self.btn_folder.pack(side="right", padx=(0, 8))
 
-        # ----- Status Bar -----
         status_line = ttk.Frame(self, style="StatusLine.TFrame", height=4)
         status_line.pack(side="bottom", fill="x")
         status = ttk.Frame(self, style="Status.TFrame")
@@ -413,7 +393,6 @@ class App(tk.Tk):
         self.progress = ttk.Progressbar(status, mode="determinate")
         self.progress.pack(side="left", fill="x", expand=True, padx=(0, 6))
 
-        # ----- Options Box -----
         box = ttk.LabelFrame(self, text="Scraper Options")
         self.opt_box = box
         box.columnconfigure(1, weight=1)
@@ -434,38 +413,36 @@ class App(tk.Tk):
         ttk.Spinbox(opts, from_=0, to=300, increment=0.5, width=6, textvariable=self.var_url_delay).pack(side="left", padx=(4, 16))
         ttk.Label(opts, text="Retries:").pack(side="left")
         ttk.Spinbox(opts, from_=0, to=10, width=5, textvariable=self.var_retries).pack(side="left", padx=(4, 16))
-        ttk.Label(opts, text="Parallel workers (1-4):").pack(side="left")
+        ttk.Label(opts, text="Workers (1-4):").pack(side="left")
         ttk.Spinbox(opts, from_=1, to=4, width=5, textvariable=self.var_workers).pack(side="left", padx=(4, 0))
 
         checks = ttk.Frame(box)
         checks.grid(row=3, column=0, columnspan=3, sticky="w", **pad)
+        ttk.Checkbutton(checks, text="Hidden Browser (Headless)", variable=self.var_headless).pack(side="left", padx=(0, 16))
         ttk.Checkbutton(checks, text="One browser for all URLs", variable=self.var_browser_mode, onvalue="single", offvalue="each").pack(side="left", padx=(0, 16))
         ttk.Checkbutton(checks, text="Stop loading early", variable=self.var_stop_loading).pack(side="left", padx=(0, 16))
-        ttk.Checkbutton(checks, text="Remove duplicates", variable=self.var_dedupe, command=self.update_link_count).pack(side="left", padx=(0, 16))
         ttk.Checkbutton(checks, text="Stealth mode", variable=self.var_stealth).pack(side="left", padx=(0, 16))
-        ttk.Checkbutton(checks, text="Skip already scraped (Resume)", variable=self.var_resume).pack(side="left")
+        ttk.Checkbutton(checks, text="Resume previous", variable=self.var_resume).pack(side="left")
 
-        # ----- Site Selector Bar -----
         site_bar = ttk.Frame(self)
         site_bar.pack(fill="x", padx=10, pady=(6, 0))
-        ttk.Label(site_bar, text="Configuration profile for:").pack(side="left")
+        ttk.Label(site_bar, text="Profile for site:").pack(side="left")
         self.cmb_set = ttk.Combobox(site_bar, state="readonly", width=26)
         self.cmb_set.pack(side="left", padx=(6, 6))
         self.cmb_set.bind("<<ComboboxSelected>>", self.on_set_selected)
         ttk.Button(site_bar, text="New site...", command=self.add_site).pack(side="left")
         ttk.Button(site_bar, text="Delete site", command=self.delete_site).pack(side="left", padx=4)
 
-        # ----- Main Panes: Links | Pre-Click Steps | Extract Fields -----
         pane_opts = dict(sashwidth=8, sashrelief="flat", bg="#E9ECF1", bd=0, opaqueresize=True)
         main_pane = tk.PanedWindow(self, orient="vertical", **pane_opts)
         main_pane.pack(fill="both", expand=True, padx=10, pady=4)
         mid = tk.PanedWindow(main_pane, orient="horizontal", **pane_opts)
         main_pane.add(mid, stretch="always", minsize=220)
 
-        # 1. Links Column
+        # 1. Links
         links = ttk.LabelFrame(mid, text="1. Target URLs")
-        mid.add(links, stretch="always", minsize=250)
-        self.txt_links = scrolledtext.ScrolledText(links, height=10, width=32, wrap="none", **TEXT_OPTS)
+        mid.add(links, stretch="always", minsize=260)
+        self.txt_links = scrolledtext.ScrolledText(links, height=10, width=35, wrap="none", **TEXT_OPTS)
         self.txt_links.pack(fill="both", expand=True, padx=6, pady=6)
         bar = ttk.Frame(links)
         bar.pack(fill="x", padx=6, pady=(0, 6))
@@ -475,53 +452,36 @@ class App(tk.Tk):
         self.lbl_count.pack(side="right")
         self.txt_links.bind("<<Modified>>", self.on_links_modified)
 
-        # 2. Pre-Extraction Clicks Column
-        steps = ttk.LabelFrame(mid, text="2. Pre-Actions (Click before scraping)")
-        mid.add(steps, stretch="always", minsize=340)
-        self.lst_steps = tk.Listbox(steps, height=8, activestyle="none", exportselection=False, **LIST_OPTS)
-        self.lst_steps.pack(fill="both", expand=True, padx=6, pady=(6, 4))
+        # 2. Sequential Workflow
+        seq_box = ttk.LabelFrame(mid, text="2. Sequential Workflow (Clicks & Extractions in Order)")
+        mid.add(seq_box, stretch="always", minsize=480)
+        self.lst_seq = tk.Listbox(seq_box, height=8, activestyle="none", exportselection=False, **LIST_OPTS)
+        self.lst_seq.pack(fill="both", expand=True, padx=6, pady=(6, 4))
 
-        r1 = ttk.Frame(steps)
-        r1.pack(fill="x", padx=6, pady=2)
-        self.btn_rec_click = ttk.Button(r1, text="\u25CF Record Clicks", command=lambda: self.toggle_record("click"))
+        sr1 = ttk.Frame(seq_box)
+        sr1.pack(fill="x", padx=6, pady=2)
+        self.btn_rec_click = ttk.Button(sr1, text="\u25CF Record Click", command=lambda: self.toggle_record("click"))
         self.btn_rec_click.pack(side="left")
-        ttk.Button(r1, text="+ Click", command=self.add_click).pack(side="left", padx=4)
-        ttk.Button(r1, text="+ Wait", command=self.add_wait).pack(side="left")
+        self.btn_rec_extract = ttk.Button(sr1, text="\u25CF Pick Extract", style="Accent.TButton", command=lambda: self.toggle_record("extract"))
+        self.btn_rec_extract.pack(side="left", padx=4)
+        ttk.Button(sr1, text="+ Wait", command=self.add_wait).pack(side="left")
 
-        r2 = ttk.Frame(steps)
-        r2.pack(fill="x", padx=6, pady=(2, 6))
-        ttk.Button(r2, text="Delete", command=self.delete_step).pack(side="left")
-        ttk.Button(r2, text="Up", width=4, command=lambda: self.move_step(-1)).pack(side="left", padx=4)
-        ttk.Button(r2, text="Down", width=5, command=lambda: self.move_step(1)).pack(side="left")
-        ttk.Button(r2, text="Clear", command=self.clear_steps).pack(side="right")
+        sr2 = ttk.Frame(seq_box)
+        sr2.pack(fill="x", padx=6, pady=(2, 6))
+        ttk.Button(sr2, text="Rename", command=self.rename_seq).pack(side="left")
+        ttk.Button(sr2, text="Delete", command=self.delete_seq_item).pack(side="left", padx=4)
+        ttk.Button(sr2, text="Up", width=4, command=lambda: self.move_seq(-1)).pack(side="left", padx=4)
+        ttk.Button(sr2, text="Down", width=5, command=lambda: self.move_seq(1)).pack(side="left")
+        ttk.Button(sr2, text="Clear", command=self.clear_seq).pack(side="right")
 
-        # 3. Fields to Extract Column
-        ext_box = ttk.LabelFrame(mid, text="3. Data to Extract (Columns in Excel)")
-        mid.add(ext_box, stretch="always", minsize=360)
-        self.lst_extracts = tk.Listbox(ext_box, height=8, activestyle="none", exportselection=False, **LIST_OPTS)
-        self.lst_extracts.pack(fill="both", expand=True, padx=6, pady=(6, 4))
-
-        er1 = ttk.Frame(ext_box)
-        er1.pack(fill="x", padx=6, pady=2)
-        self.btn_rec_extract = ttk.Button(er1, text="\u25CF Pick Elements Visually", style="Accent.TButton", command=lambda: self.toggle_record("extract"))
-        self.btn_rec_extract.pack(side="left")
-        ttk.Button(er1, text="+ Manual Field", command=self.add_extract_manual).pack(side="left", padx=4)
-
-        er2 = ttk.Frame(ext_box)
-        er2.pack(fill="x", padx=6, pady=(2, 6))
-        ttk.Button(er2, text="Rename Col", command=self.rename_extract).pack(side="left")
-        ttk.Button(er2, text="Delete", command=self.delete_extract).pack(side="left", padx=4)
-        ttk.Button(er2, text="Clear", command=self.clear_extracts).pack(side="right")
-
-        # ----- Log -----
+        # Log
         logf = ttk.LabelFrame(main_pane, text="Scraping Log")
         main_pane.add(logf, stretch="always", minsize=90)
         self.txt_log = scrolledtext.ScrolledText(logf, height=7, state="disabled", **TEXT_OPTS)
         self.txt_log.pack(fill="both", expand=True, padx=6, pady=6)
 
         self.refresh_sets()
-        self.refresh_steps()
-        self.refresh_extracts()
+        self.refresh_sequence()
         self.update_summary()
         self.set_options(False)
 
@@ -562,7 +522,9 @@ class App(tk.Tk):
         self.btn_options.config(text=f"\u2630 Options {'\u25BE' if show else '\u25B8'}")
 
     def update_summary(self):
-        self.lbl_summary.config(text=f"Pre-steps: {len(self.steps)}   \u00B7   Extract Columns: {len(self.extracts)}   \u00B7   Workers: {num(self.var_workers, 1)}")
+        extract_count = sum(1 for item in self.sequence if item["type"] == "extract")
+        headless_txt = "Hidden" if self.var_headless.get() else "Visible"
+        self.lbl_summary.config(text=f"Browser: {headless_txt}   \u00B7   Steps/Extracts: {len(self.sequence)} ({extract_count} fields)   \u00B7   Workers: {num(self.var_workers, 1)}")
 
     def update_link_count(self):
         self.lbl_count.config(text=f"{len(self.get_links())} links")
@@ -603,7 +565,7 @@ class App(tk.Tk):
 
     def export_excel(self):
         folder = self.var_folder.get().strip()
-        tsv_path = os.path.join(folder, "Scraped_Data.txt") if folder else ""
+        tsv_path = os.path.join(folder, "Sequential_Scraped_Data.txt") if folder else ""
         if not tsv_path or not os.path.exists(tsv_path):
             messagebox.showinfo("Export Excel", "No scraped data found yet.")
             return
@@ -619,18 +581,15 @@ class App(tk.Tk):
         except Exception as e:
             messagebox.showerror("Export Excel", f"Error:\n{e}")
 
-    # ----- Profiles -----
     def refresh_sets(self):
-        keys = [ALL_SITES] + sorted((set(self.step_sets) | set(self.extract_sets)) - {ALL_SITES})
+        keys = [ALL_SITES] + sorted(set(self.sequence_sets) - {ALL_SITES})
         self.cmb_set.config(values=[ALL_SITES_LABEL if k == ALL_SITES else k for k in keys])
         self.cmb_set.set(ALL_SITES_LABEL if self.current_set == ALL_SITES else self.current_set)
 
     def on_set_selected(self, _event=None):
         label = self.cmb_set.get()
         self.current_set = ALL_SITES if label == ALL_SITES_LABEL else label
-        self.refresh_steps()
-        self.refresh_extracts()
-        self.update_summary()
+        self.refresh_sequence()
 
     def add_site(self):
         links = self.get_links()
@@ -638,107 +597,74 @@ class App(tk.Tk):
         text = simpledialog.askstring("New site", "Domain name:", initialvalue=first, parent=self)
         host = host_of(text.strip()) if text else ""
         if host:
-            self.step_sets.setdefault(host, [])
-            self.extract_sets.setdefault(host, [])
+            self.sequence_sets.setdefault(host, [])
             self.current_set = host
             self.refresh_sets()
-            self.refresh_steps()
-            self.refresh_extracts()
+            self.refresh_sequence()
 
     def delete_site(self):
         if self.current_set != ALL_SITES and messagebox.askyesno("Delete site", f"Delete profile for {self.current_set}?"):
-            self.step_sets.pop(self.current_set, None)
-            self.extract_sets.pop(self.current_set, None)
+            self.sequence_sets.pop(self.current_set, None)
             self.current_set = ALL_SITES
             self.refresh_sets()
-            self.refresh_steps()
-            self.refresh_extracts()
+            self.refresh_sequence()
 
-    # ----- Pre-Action Steps List -----
-    def refresh_steps(self, select=None):
-        self.lst_steps.delete(0, "end")
-        for n, st in enumerate(self.steps, 1):
-            txt = f"{n}. Wait {st['seconds']:g} s" if st["type"] == "wait" else f"{n}. Click: {st['selector']}"
-            self.lst_steps.insert("end", txt)
-        if select is not None and 0 <= select < len(self.steps):
-            self.lst_steps.selection_set(select)
+    def refresh_sequence(self, select=None):
+        self.lst_seq.delete(0, "end")
+        for n, item in enumerate(self.sequence, 1):
+            t = item["type"]
+            if t == "wait":
+                txt = f"{n}. [WAIT] {item['seconds']:g} seconds"
+            elif t == "click":
+                txt = f"{n}. [CLICK STEP] -> {item['selector']}"
+            elif t == "extract":
+                txt = f"{n}. [EXTRACT FIELD: {item['name']}] -> {item['selector']}"
+            self.lst_seq.insert("end", txt)
+        if select is not None and 0 <= select < len(self.sequence):
+            self.lst_seq.selection_set(select)
         self.update_summary()
 
-    def delete_step(self):
-        sel = self.lst_steps.curselection()
+    def delete_seq_item(self):
+        sel = self.lst_seq.curselection()
         if sel:
-            del self.steps[sel[0]]
-            self.refresh_steps()
+            del self.sequence[sel[0]]
+            self.refresh_sequence()
 
-    def move_step(self, delta):
-        sel = self.lst_steps.curselection()
+    def move_seq(self, delta):
+        sel = self.lst_seq.curselection()
         if not sel:
             return
         i = sel[0]
         j = i + delta
-        if 0 <= j < len(self.steps):
-            self.steps[i], self.steps[j] = self.steps[j], self.steps[i]
-            self.refresh_steps(select=j)
+        if 0 <= j < len(self.sequence):
+            self.sequence[i], self.sequence[j] = self.sequence[j], self.sequence[i]
+            self.refresh_sequence(select=j)
 
-    def clear_steps(self):
-        if self.steps and messagebox.askyesno("Clear", "Remove all pre-steps?"):
-            self.steps = []
-            self.refresh_steps()
+    def clear_seq(self):
+        if self.sequence and messagebox.askyesno("Clear", "Remove all workflow steps?"):
+            self.sequence = []
+            self.refresh_sequence()
 
     def add_wait(self):
-        sec = simpledialog.askfloat("Wait", "Seconds:", minvalue=0.1, maxvalue=60, parent=self)
+        sec = simpledialog.askfloat("Wait", "Seconds to wait:", minvalue=0.1, maxvalue=60, parent=self)
         if sec:
-            self.steps.append({"type": "wait", "seconds": sec})
-            self.refresh_steps(select=len(self.steps) - 1)
+            self.sequence.append({"type": "wait", "seconds": sec})
+            self.refresh_sequence(select=len(self.sequence) - 1)
 
-    def add_click(self):
-        sel = simpledialog.askstring("Add Click", "CSS Selector to click:", parent=self)
-        if sel and sel.strip():
-            self.steps.append({"type": "click", "selector": sel.strip()})
-            self.refresh_steps(select=len(self.steps) - 1)
-
-    # ----- Extraction Fields List -----
-    def refresh_extracts(self, select=None):
-        self.lst_extracts.delete(0, "end")
-        for n, ex in enumerate(self.extracts, 1):
-            sample = f"  (e.g. '{ex['sample']}')" if ex.get("sample") else ""
-            self.lst_extracts.insert("end", f"{n}. [{ex['name']}] -> {ex['selector']}{sample}")
-        if select is not None and 0 <= select < len(self.extracts):
-            self.lst_extracts.selection_set(select)
-        self.update_summary()
-
-    def add_extract_manual(self):
-        name = simpledialog.askstring("Column Name", "Enter Excel Column Name (e.g. Price, Part Number):", parent=self)
-        if not name or not name.strip():
-            return
-        sel = simpledialog.askstring("Selector", f"Enter CSS Selector for '{name.strip()}':", parent=self)
-        if sel and sel.strip():
-            self.extracts.append({"name": name.strip(), "selector": sel.strip(), "sample": ""})
-            self.refresh_extracts(select=len(self.extracts) - 1)
-
-    def rename_extract(self):
-        sel = self.lst_extracts.curselection()
+    def rename_seq(self):
+        sel = self.lst_seq.curselection()
         if not sel:
             return
         idx = sel[0]
-        cur_name = self.extracts[idx]["name"]
-        new_name = simpledialog.askstring("Rename Column", "New column name:", initialvalue=cur_name, parent=self)
-        if new_name and new_name.strip():
-            self.extracts[idx]["name"] = new_name.strip()
-            self.refresh_extracts(select=idx)
+        item = self.sequence[idx]
+        if item["type"] == "extract":
+            new_name = simpledialog.askstring("Rename Field", "New column name:", initialvalue=item["name"], parent=self)
+            if new_name and new_name.strip():
+                item["name"] = new_name.strip()
+                self.refresh_sequence(select=idx)
+        else:
+            messagebox.showinfo("Info", "Only Extract fields can be renamed.")
 
-    def delete_extract(self):
-        sel = self.lst_extracts.curselection()
-        if sel:
-            del self.extracts[sel[0]]
-            self.refresh_extracts()
-
-    def clear_extracts(self):
-        if self.extracts and messagebox.askyesno("Clear", "Remove all extraction fields?"):
-            self.extracts = []
-            self.refresh_extracts()
-
-    # ----- Dual Visual Recording (Click Mode vs Extract Mode) -----
     def toggle_record(self, mode):
         if self.rec_mode is not None:
             self.rec_stop.set()
@@ -750,15 +676,14 @@ class App(tk.Tk):
 
         self.rec_mode = mode
         self.rec_stop.clear()
-        self.btn_start.config(state="disabled")
         if mode == "click":
-            self.btn_rec_click.config(text="\u25A0 Stop Recording")
+            self.btn_rec_click.config(text="\u25A0 Stop Click Rec")
             self.btn_rec_extract.config(state="disabled")
-            self.log("MODE: Recording PRE-ACTIONS. Click buttons/tabs you want automated before scraping.")
+            self.log("MODE: Recording Click Action...")
         else:
-            self.btn_rec_extract.config(text="\u25A0 Stop Picking")
+            self.btn_rec_extract.config(text="\u25A0 Stop Extract Pick")
             self.btn_rec_click.config(state="disabled")
-            self.log("MODE: PICKING DATA FIELDS. Hover & click elements to extract (links won't open).")
+            self.log("MODE: Picking Extract Field (Hover & Click)...")
 
         threading.Thread(target=self.record_worker, args=(url, mode, self.var_driver.get().strip(), self.var_stealth.get()), daemon=True).start()
 
@@ -829,24 +754,26 @@ class App(tk.Tk):
                     self.btn_rec_click.config(state="normal")
                     self.btn_rec_extract.config(state="normal")
                 elif kind == "rec_event":
-                    if data.get("mode") == "click":
-                        self.steps.append({"type": "click", "selector": data["selector"]})
-                        self.refresh_steps(select=len(self.steps) - 1)
-                        self.log(f"[Pre-Click Recorded]: {data['selector']}")
-                    elif data.get("mode") == "extract":
-                        col_name = f"Field_{len(self.extracts) + 1}"
-                        self.extracts.append({
+                    m = data.get("type")
+                    if m == "click":
+                        self.sequence.append({"type": "click", "selector": data["selector"]})
+                        self.refresh_sequence(select=len(self.sequence) - 1)
+                        self.log(f"[Recorded Click Step]: {data['selector']}")
+                    elif m == "extract":
+                        extract_count = sum(1 for item in self.sequence if item["type"] == "extract")
+                        col_name = f"Field_{extract_count + 1}"
+                        self.sequence.append({
+                            "type": "extract",
                             "name": col_name,
                             "selector": data["selector"],
                             "sample": data.get("sample", "")
                         })
-                        self.refresh_extracts(select=len(self.extracts) - 1)
-                        self.log(f"[Extract Field Picked]: {col_name} -> {data['selector']} (Sample: {data.get('sample', '')})")
+                        self.refresh_sequence(select=len(self.sequence) - 1)
+                        self.log(f"[Recorded Extract Field]: {col_name} -> {data['selector']} (Sample: {data.get('sample', '')})")
                 elif kind == "rec_done":
                     self.rec_mode = None
-                    self.btn_rec_click.config(text="\u25CF Record Clicks", state="normal")
-                    self.btn_rec_extract.config(text="\u25CF Pick Elements Visually", state="normal")
-                    self.btn_start.config(state="normal")
+                    self.btn_rec_click.config(text="\u25CF Record Click", state="normal")
+                    self.btn_rec_extract.config(text="\u25CF Pick Extract", state="normal")
                     self.log("Visual session closed.")
         except queue.Empty:
             pass
@@ -864,7 +791,6 @@ class App(tk.Tk):
                     pass
         self.destroy()
 
-    # ----- Scraping Execution -----
     def build_cfg(self):
         folder = self.var_folder.get().strip()
         links = self.get_links()
@@ -881,9 +807,9 @@ class App(tk.Tk):
             "step_delay": num(self.var_step_delay, 1),
             "after_steps": num(self.var_after_steps, 2),
             "continue_missing": self.var_continue.get(),
-            "step_sets": json.loads(json.dumps(self.step_sets)),
-            "extract_sets": json.loads(json.dumps(self.extract_sets)),
+            "sequence_sets": json.loads(json.dumps(self.sequence_sets)),
             "new_browser": self.var_browser_mode.get() == "each",
+            "headless": self.var_headless.get(),
             "stealth": self.var_stealth.get(),
             "url_delay": num(self.var_url_delay, 0),
             "retries": max(0, num(self.var_retries, 2)),
@@ -916,7 +842,6 @@ class App(tk.Tk):
             return
         links, cfg = built
         self.save_settings()
-        self.stop_event.clear()
         threading.Thread(target=self.run_test, args=(links[0], cfg), daemon=True).start()
 
     def run_test(self, link, cfg):
@@ -925,10 +850,12 @@ class App(tk.Tk):
         driver = None
         try:
             driver = self.new_driver(cfg)
-            fields = items_for_url(cfg["extract_sets"], link)
-            vals, status, note = self.scrape_url(driver, link, cfg, fields)
+            seq = steps_for_url(cfg["sequence_sets"], link)
+            page_title, vals, status, note = self.execute_sequence(driver, link, cfg, seq)
+            q.put(("log", f"   Page Title: {page_title}"))
             q.put(("log", f"   Status: {status} {note}"))
-            for f, v in zip(fields, vals):
+            extract_fields = [item for item in seq if item["type"] == "extract"]
+            for f, v in zip(extract_fields, vals):
                 q.put(("log", f"   [{f['name']}]: {v}"))
         except Exception as e:
             q.put(("log", f"   Error: {e}"))
@@ -943,6 +870,9 @@ class App(tk.Tk):
         options = webdriver.ChromeOptions()
         options.page_load_strategy = "none"
         options.add_argument("--start-maximized")
+        if cfg.get("headless"):
+            options.add_argument("--headless=new")
+            options.add_argument("--window-size=1920,1080")
         if cfg.get("stealth"):
             apply_stealth_options(options)
         driver = webdriver.Chrome(service=make_service(cfg["driver"]), options=options)
@@ -959,52 +889,51 @@ class App(tk.Tk):
             except Exception:
                 pass
 
-    def run_steps(self, driver, steps, cfg):
-        for st in steps:
-            if st["type"] == "wait":
-                time.sleep(st["seconds"])
-                continue
-            by, val = parse_selector(st["selector"])
-            try:
-                els = WebDriverWait(driver, cfg["step_timeout"]).until(lambda d: d.find_elements(by, val) or False)
-            except TimeoutException:
-                els = []
-            if not els:
-                if cfg["continue_missing"]:
-                    continue
-                raise RuntimeError(f"Pre-action element not found ({st['selector']})")
-            visible = [e for e in els if is_displayed(e)] or els
-            for el in visible[:1]:
-                try:
-                    click_element(driver, el)
-                except Exception:
-                    pass
-            time.sleep(cfg["step_delay"])
-
-    def scrape_url(self, driver, link, cfg, fields):
+    def execute_sequence(self, driver, link, cfg, sequence):
         driver.get(link)
         time.sleep(cfg["load_wait"])
         if cfg["stop_loading"]:
             driver.execute_script("window.stop();")
 
-        steps = items_for_url(cfg["step_sets"], link)
-        if steps:
-            self.run_steps(driver, steps, cfg)
-            time.sleep(cfg["after_steps"])
-
+        page_title = driver.title.strip()
         extracted_values = []
-        for field in fields:
-            by, val = parse_selector(field["selector"])
-            try:
-                els = driver.find_elements(by, val)
-                texts = [e.text.strip() for e in els if e.text.strip()]
-                extracted_values.append(" | ".join(texts) if texts else "")
-            except Exception:
-                extracted_values.append("")
-        return extracted_values, "OK", ""
 
-    def worker_loop(self, task_q, cfg, ctx, all_fields):
+        for item in sequence:
+            t = item["type"]
+            if t == "wait":
+                time.sleep(item["seconds"])
+            elif t == "click":
+                by, val = parse_selector(item["selector"])
+                try:
+                    els = WebDriverWait(driver, cfg["step_timeout"]).until(lambda d: d.find_elements(by, val) or False)
+                except TimeoutException:
+                    els = []
+                if not els:
+                    if cfg["continue_missing"]:
+                        continue
+                    raise RuntimeError(f"Element not found for click: {item['selector']}")
+                visible = [e for e in els if is_displayed(e)] or els
+                for el in visible[:1]:
+                    try:
+                        click_element(driver, el)
+                    except Exception:
+                        pass
+                time.sleep(cfg["step_delay"])
+            elif t == "extract":
+                by, val = parse_selector(item["selector"])
+                try:
+                    els = driver.find_elements(by, val)
+                    texts = [e.text.strip() for e in els if e.text.strip()]
+                    extracted_values.append(" | ".join(texts) if texts else "")
+                except Exception:
+                    extracted_values.append("")
+
+        return page_title, extracted_values, "OK", ""
+
+    def worker_loop(self, task_q, cfg, ctx, active_sequence):
         holder = {"d": None}
+        extract_fields = [item for item in active_sequence if item["type"] == "extract"]
+        
         try:
             while not self.stop_event.is_set():
                 try:
@@ -1013,14 +942,14 @@ class App(tk.Tk):
                     break
                 self.msg_queue.put(("log", f"Scraping [{i + 1}/{ctx['total']}]: {link}"))
                 
-                vals, status, note = [""] * len(all_fields), "Error", ""
+                page_title, vals, status, note = "", [""] * len(extract_fields), "Error", ""
                 for attempt in range(1, cfg["retries"] + 2):
                     if self.stop_event.is_set():
                         break
                     try:
                         if holder["d"] is None:
                             holder["d"] = self.new_driver(cfg)
-                        vals, status, note = self.scrape_url(holder["d"], link, cfg, all_fields)
+                        page_title, vals, status, note = self.execute_sequence(holder["d"], link, cfg, active_sequence)
                         break
                     except Exception as e:
                         note = str(e).splitlines()[0] if str(e) else type(e).__name__
@@ -1030,7 +959,7 @@ class App(tk.Tk):
                     if attempt <= cfg["retries"] and not self.stop_event.is_set():
                         time.sleep(2)
 
-                row = [link, status, note, datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")] + vals
+                row = [link, page_title, status, note, datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")] + vals
                 with ctx["lock"]:
                     ctx["out"].write(tsv(row))
                     ctx["out"].flush()
@@ -1042,17 +971,19 @@ class App(tk.Tk):
     def run_job(self, links, cfg):
         q = self.msg_queue
         total = len(links)
-        out_path = os.path.join(cfg["folder"], "Scraped_Data.txt")
+        out_path = os.path.join(cfg["folder"], "Sequential_Scraped_Data.txt")
         
-        active_fields = items_for_url(cfg["extract_sets"], links[0])
-        header = ["URL", "Status", "Notes", "Timestamp"] + [f["name"] for f in active_fields]
+        active_sequence = steps_for_url(cfg["sequence_sets"], links[0])
+        extract_fields = [item for item in active_sequence if item["type"] == "extract"]
+        
+        header = ["Page Link", "Page Title", "Status", "Notes", "Timestamp"] + [f["name"] for f in extract_fields]
 
         done_links = set()
         if cfg["resume"] and os.path.exists(out_path):
             with open(out_path, encoding="utf-8") as f:
                 for line in f:
                     parts = line.split("\t")
-                    if len(parts) > 1 and parts[1] == "OK":
+                    if len(parts) > 2 and parts[2] == "OK":
                         done_links.add(parts[0])
 
         todo = [(i, l) for i, l in enumerate(links) if l not in done_links]
@@ -1070,7 +1001,7 @@ class App(tk.Tk):
         n_workers = max(1, min(cfg["workers"], len(todo))) if todo else 0
         with open(out_path, "a", encoding="utf-8") as out:
             ctx["out"] = out
-            threads = [threading.Thread(target=self.worker_loop, args=(task_q, cfg, ctx, active_fields), daemon=True) for _ in range(n_workers)]
+            threads = [threading.Thread(target=self.worker_loop, args=(task_q, cfg, ctx, active_sequence), daemon=True) for _ in range(n_workers)]
             for t in threads: t.start()
             for t in threads: t.join()
 
