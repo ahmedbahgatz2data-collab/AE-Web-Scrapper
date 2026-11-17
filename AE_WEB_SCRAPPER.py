@@ -15,6 +15,7 @@ from tkinter import ttk, filedialog, messagebox, scrolledtext, simpledialog
 
 from selenium import webdriver
 from selenium.webdriver.common.by import By
+from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.common.exceptions import TimeoutException
@@ -59,7 +60,7 @@ REC_JS = r"""
     var tag = el.tagName.toLowerCase();
     if (el.id && uniq('#' + CSS.escape(el.id))) return '#' + CSS.escape(el.id);
 
-    var attrs = ['data-testid', 'data-test', 'data-id', 'name', 'aria-label', 'title'];
+    var attrs = ['data-testid', 'data-test', 'data-id', 'name', 'aria-label', 'placeholder', 'title'];
     for (var i = 0; i < attrs.length; i++) {
       var v = el.getAttribute(attrs[i]);
       if (v && v.length < 80) {
@@ -149,20 +150,23 @@ REC_JS = r"""
 
   var lastHovered = null;
   document.addEventListener('mouseover', function (e) {
-    if (window.__recMode !== 'extract') return;
+    if (window.__recMode !== 'extract' && window.__recMode !== 'searchbox') return;
     if (lastHovered) lastHovered.style.outline = '';
     lastHovered = e.target;
-    lastHovered.style.outline = '2px solid #FF8C00';
+    lastHovered.style.outline = (window.__recMode === 'searchbox') ? '2px solid #1EA5FF' : '2px solid #FF8C00';
   }, true);
 
   document.addEventListener('click', function (e) {
     try {
       var mode = window.__recMode || 'click';
-      var t = (mode === 'click')
-        ? (e.target.closest('select,a,button,input,label,summary,[role=button],[role=tab],[onclick]') || e.target)
-        : e.target;
+      var t = e.target;
+      if (mode === 'click') {
+        t = e.target.closest('select,a,button,input,label,summary,[role=button],[role=tab],[onclick]') || e.target;
+      } else if (mode === 'searchbox') {
+        t = e.target.closest('input,textarea,[contenteditable="true"]') || e.target;
+      }
 
-      if (mode === 'extract') {
+      if (mode === 'extract' || mode === 'searchbox') {
         e.preventDefault();
         e.stopPropagation();
         t.style.outline = '2px solid #62C93F';
@@ -193,13 +197,18 @@ REC_JS = r"""
 
 SET_SELECT_VALUE_JS = r"""
 var el = arguments[0];
-var targetVal = String(arguments[1]);
+var targetVal = String(arguments[1]).trim();
+var targetLow = targetVal.toLowerCase();
 
 if (el.tagName && el.tagName.toLowerCase() === 'select') {
   var found = false;
+  var matchedVal = targetVal;
   for (var i = 0; i < el.options.length; i++) {
-    if (el.options[i].value === targetVal || el.options[i].text.trim() === targetVal) {
+    var optVal = (el.options[i].value || '').trim();
+    var optTxt = (el.options[i].text || '').trim();
+    if (optVal.toLowerCase() === targetLow || optTxt.toLowerCase() === targetLow) {
       el.selectedIndex = i;
+      matchedVal = optVal || optTxt;
       found = true;
       break;
     }
@@ -214,22 +223,26 @@ if (el.tagName && el.tagName.toLowerCase() === 'select') {
   el.dispatchEvent(new Event('change', { bubbles: true }));
   el.dispatchEvent(new Event('input', { bubbles: true }));
 
-  // دعم إضافي لمكتبة DataTables لإجبارها على تطبيق العدد الجديد فوراً
   try {
     if (window.jQuery && window.jQuery.fn && window.jQuery.fn.dataTable) {
       var tbl = window.jQuery(el).closest('.dataTables_wrapper').find('table.dataTable');
       if (tbl.length) {
-        tbl.DataTable().page.len(parseInt(targetVal, 10)).draw();
+        var numLen = parseInt(matchedVal, 10);
+        if (!isNaN(numLen)) {
+          tbl.DataTable().page.len(numLen).draw();
+        } else if (targetLow.indexOf('all') !== -1) {
+          tbl.DataTable().page.len(-1).draw();
+        }
       }
     }
   } catch (e) {}
 } else {
-  // إذا لم يكن العنصر select تقليدياً (قائمة مخصصة div/ul)، نبحث عن عنصر يحمل النص المطلوب ونضغطه
   el.click();
   setTimeout(function () {
     var items = document.querySelectorAll('li, option, [role="option"], a, button, span, div');
     for (var j = 0; j < items.length; j++) {
-      if ((items[j].innerText || '').trim() === targetVal) {
+      var t = (items[j].innerText || '').trim().toLowerCase();
+      if (t === targetLow) {
         items[j].click();
         break;
       }
@@ -277,26 +290,44 @@ def is_port_open(port):
         return s.connect_ex(("127.0.0.1", port)) == 0
 
 
-def launch_real_chrome(port=9222, headless=False, chrome_path=""):
+def parse_chrome_profile_args(custom_profile_path, port):
+    """
+    يدعم تمرير مجلد البروفايل مباشرة (مثل C:\\...\\Chrome\\User Data\\Profile 1 أو Default)
+    ويفصل تلقائياً بين --user-data-dir و --profile-directory.
+    """
+    if custom_profile_path and custom_profile_path.strip():
+        p = os.path.normpath(custom_profile_path.strip())
+        base_name = os.path.basename(p)
+        parent_dir = os.path.dirname(p)
+        if base_name == "Default" or base_name.startswith("Profile "):
+            return parent_dir, base_name
+        return p, None
+
+    base = os.environ.get("APPDATA") or os.path.join(os.path.expanduser("~"), ".config")
+    default_dir = os.path.join(base, "WebScraperTool", f"RealChromeProfile_{port}")
+    os.makedirs(default_dir, exist_ok=True)
+    return default_dir, None
+
+
+def launch_real_chrome(port=9222, headless=False, chrome_path="", custom_profile=""):
     if is_port_open(port):
-        return True, f"Connected to already running Chrome on port {port}"
+        return True, f"Connected to running Chrome on port {port}"
 
     chrome_exe = find_system_chrome(chrome_path)
     if not chrome_exe:
         return False, "Could not find chrome.exe automatically. Please select chrome.exe in Global Options."
 
-    base = os.environ.get("APPDATA") or os.path.join(os.path.expanduser("~"), ".config")
-    profile_dir = os.path.join(base, "WebScraperTool", f"RealChromeProfile_{port}")
-    os.makedirs(profile_dir, exist_ok=True)
-
+    user_data_dir, profile_sub = parse_chrome_profile_args(custom_profile, port)
     cmd = [
         chrome_exe,
         f"--remote-debugging-port={port}",
-        f"--user-data-dir={profile_dir}",
+        f"--user-data-dir={user_data_dir}",
         "--no-first-run",
         "--no-default-browser-check",
         "--start-maximized",
     ]
+    if profile_sub:
+        cmd.append(f"--profile-directory={profile_sub}")
     if headless:
         cmd.append("--headless=new")
         cmd.append("--window-size=1920,1080")
@@ -308,9 +339,10 @@ def launch_real_chrome(port=9222, headless=False, chrome_path=""):
 
     for _ in range(35):
         if is_port_open(port):
-            return True, f"Launched Real Chrome ({chrome_exe}) on port {port}"
+            prof_msg = f" [Profile: {profile_sub}]" if profile_sub else ""
+            return True, f"Launched Real Chrome{prof_msg} on port {port}"
         time.sleep(0.2)
-    return False, f"Chrome launched ({chrome_exe}) but port {port} did not open in time."
+    return False, f"Chrome launched but port {port} did not open. (Tip: Close existing Chrome windows using the same profile first)."
 
 
 def parse_selector(sel):
@@ -324,7 +356,8 @@ def parse_selector(sel):
     return By.CSS_SELECTOR, sel
 
 
-def extract_element_value(el, attr_mode):
+def extract_element_pair(el):
+    """استخراج النص والرابط معاً كـ (text, href) من العنصر."""
     txt = ""
     href = ""
     try:
@@ -333,27 +366,20 @@ def extract_element_value(el, attr_mode):
     except Exception:
         pass
 
-    if attr_mode in ("href", "both"):
-        try:
-            href = el.get_attribute("href") or el.get_attribute("src") or ""
-            if not href:
-                sub_links = el.find_elements(By.TAG_NAME, "a")
-                if sub_links:
-                    href = sub_links[0].get_attribute("href") or ""
-            if not href:
-                anc = el.find_elements(By.XPATH, "./ancestor::a[1]")
-                if anc:
-                    href = anc[0].get_attribute("href") or ""
-        except Exception:
-            pass
+    try:
+        href = el.get_attribute("href") or el.get_attribute("src") or ""
+        if not href:
+            sub_links = el.find_elements(By.TAG_NAME, "a")
+            if sub_links:
+                href = sub_links[0].get_attribute("href") or ""
+        if not href:
+            anc = el.find_elements(By.XPATH, "./ancestor::a[1]")
+            if anc:
+                href = anc[0].get_attribute("href") or ""
+    except Exception:
+        pass
 
-    if attr_mode == "href":
-        return href.strip()
-    if attr_mode == "both":
-        if txt and href:
-            return f"{txt} ({href.strip()})"
-        return href.strip() or txt
-    return txt
+    return txt, href.strip()
 
 
 def apply_stealth_options(options):
@@ -376,6 +402,15 @@ def apply_stealth_driver(driver):
             "Network.setUserAgentOverride",
             {"userAgent": ua.replace("HeadlessChrome", "Chrome"), "acceptLanguage": "en-US,en;q=0.9"},
         )
+    except Exception:
+        pass
+
+
+def apply_zoom(driver, zoom_pct):
+    try:
+        z = int(zoom_pct)
+        if z and z != 100:
+            driver.execute_script(f"document.body.style.zoom = '{z}%';")
     except Exception:
         pass
 
@@ -423,10 +458,11 @@ def num(var, default):
 
 ALL_SITES = "*"
 ALL_SITES_LABEL = "All sites (default)"
-APP_VERSION = "3.5.0-custom-page-size"
+APP_VERSION = "3.6.0-full-suite"
 SITE_OPT_KEYS = (
     "load_wait", "step_timeout", "step_delay", "url_delay",
-    "stop_loading", "stealth", "headless", "new_browser", "use_real_chrome"
+    "stop_loading", "stealth", "headless", "new_browser",
+    "use_real_chrome", "zoom_pct"
 )
 
 
@@ -587,8 +623,8 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title(f"Multi-Site Sequential Web Scraper Pro  v{APP_VERSION}")
-        self.geometry("1180x830")
-        self.minsize(980, 680)
+        self.geometry("1220x860")
+        self.minsize(1020, 700)
 
         self.msg_queue = queue.Queue()
         self.stop_event = threading.Event()
@@ -597,19 +633,30 @@ class App(tk.Tk):
         self.rec_mode = None
         self.rec_driver = None
         self.live_drivers = set()
-        self.opt_visible = False
+        self.opt_visible = True
         self.drag_index = None
 
         self.sequence_sets = {ALL_SITES: []}
         self.site_settings = {}
         self.current_set = ALL_SITES
         self.saved_links = ""
+        self.saved_keywords = ""
 
         self.var_folder = tk.StringVar()
         self.var_driver = tk.StringVar()
         self.var_chrome_exe = tk.StringVar()
+        self.var_chrome_profile = tk.StringVar()
         self.var_use_real_chrome = tk.BooleanVar(value=True)
         self.var_debug_port = tk.IntVar(value=9222)
+        self.var_close_on_finish = tk.BooleanVar(value=True)
+        self.var_zoom_pct = tk.IntVar(value=100)
+
+        # Search Mode Variables
+        self.var_input_mode = tk.StringVar(value="urls")  # "urls" or "search"
+        self.var_search_url = tk.StringVar()
+        self.var_search_input_sel = tk.StringVar()
+        self.var_search_btn_sel = tk.StringVar()
+
         self.var_load_wait = tk.IntVar(value=5)
         self.var_stop_loading = tk.BooleanVar(value=True)
         self.var_dedupe = tk.BooleanVar(value=True)
@@ -625,8 +672,12 @@ class App(tk.Tk):
         self.var_resume = tk.BooleanVar(value=True)
 
         self.persist = {
-            "folder": self.var_folder, "driver": self.var_driver, "chrome_exe": self.var_chrome_exe,
+            "folder": self.var_folder, "driver": self.var_driver,
+            "chrome_exe": self.var_chrome_exe, "chrome_profile": self.var_chrome_profile,
             "use_real_chrome": self.var_use_real_chrome, "debug_port": self.var_debug_port,
+            "close_on_finish": self.var_close_on_finish, "zoom_pct": self.var_zoom_pct,
+            "input_mode": self.var_input_mode, "search_url": self.var_search_url,
+            "search_input_sel": self.var_search_input_sel, "search_btn_sel": self.var_search_btn_sel,
             "load_wait": self.var_load_wait, "stop_loading": self.var_stop_loading,
             "dedupe": self.var_dedupe, "browser_mode": self.var_browser_mode,
             "headless": self.var_headless, "stealth": self.var_stealth,
@@ -640,6 +691,10 @@ class App(tk.Tk):
         if self.saved_links:
             self.txt_links.insert("1.0", self.saved_links)
             self.update_link_count()
+        if self.saved_keywords:
+            self.txt_keywords.insert("1.0", self.saved_keywords)
+            self.update_kw_count()
+        self.switch_input_mode()
         self.protocol("WM_DELETE_WINDOW", self.on_close)
         self.after(100, self.poll_queue)
 
@@ -674,6 +729,8 @@ class App(tk.Tk):
             self.current_set = data["current_set"]
         if isinstance(data.get("links"), str):
             self.saved_links = data["links"]
+        if isinstance(data.get("keywords"), str):
+            self.saved_keywords = data["keywords"]
 
     def save_settings(self):
         data = {key: var.get() for key, var in self.persist.items() if hasattr(var, "get")}
@@ -681,6 +738,7 @@ class App(tk.Tk):
         data["site_settings"] = self.site_settings
         data["current_set"] = self.current_set
         data["links"] = self.txt_links.get("1.0", "end").strip()
+        data["keywords"] = self.txt_keywords.get("1.0", "end").strip()
         try:
             path = settings_file()
             os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -714,24 +772,25 @@ class App(tk.Tk):
                 self.load_settings()
                 self.refresh_sets()
                 self.refresh_sequence()
+                self.switch_input_mode()
                 self.log(f"Settings imported from: {f}")
             except Exception as e:
                 messagebox.showerror("Import Settings", f"Invalid settings file:\n{e}")
 
     def build_ui(self):
         self.apply_theme()
-        pad = {"padx": 8, "pady": 4}
+        pad = {"padx": 8, "pady": 3}
 
         # ----- Toolbar -----
         self.toolbar = ttk.Frame(self, style="Toolbar.TFrame")
         self.toolbar.pack(side="top", fill="x")
         tb = ttk.Frame(self.toolbar, style="Toolbar.TFrame")
-        tb.pack(fill="x", padx=12, pady=10)
-        self.btn_start = ttk.Button(tb, text="\u25B6 Start Multi-Site Scraping", style="Accent.TButton", command=self.start)
+        tb.pack(fill="x", padx=12, pady=9)
+        self.btn_start = ttk.Button(tb, text="\u25B6 Start Scraping", style="Accent.TButton", command=self.start)
         self.btn_start.pack(side="left")
         self.btn_stop = ttk.Button(tb, text="\u25A0 Stop", style="Toolbar.TButton", command=self.stop, state="disabled")
         self.btn_stop.pack(side="left", padx=(8, 0))
-        self.btn_test = ttk.Button(tb, text="Test on first link", style="Toolbar.TButton", command=self.test_first)
+        self.btn_test = ttk.Button(tb, text="Test on 1st Item", style="Toolbar.TButton", command=self.test_first)
         self.btn_test.pack(side="left", padx=(8, 0))
 
         self.btn_options = ttk.Button(tb, text="", style="Toolbar.TButton", command=self.toggle_options)
@@ -747,69 +806,78 @@ class App(tk.Tk):
         status = ttk.Frame(self, style="Status.TFrame")
         status.pack(side="bottom", fill="x")
         self.lbl_summary = ttk.Label(status, text="", style="Status.TLabel")
-        self.lbl_summary.pack(side="left", padx=12, pady=8)
+        self.lbl_summary.pack(side="left", padx=12, pady=7)
         self.lbl_progress = ttk.Label(status, text="0 / 0", style="Status.TLabel")
         self.lbl_progress.pack(side="right", padx=12)
         self.progress = ttk.Progressbar(status, mode="determinate")
         self.progress.pack(side="left", fill="x", expand=True, padx=(0, 6))
 
         # ----- Global Options Panel -----
-        box = ttk.LabelFrame(self, text="Global Scraper Options (Default for all sites unless overridden)")
+        box = ttk.LabelFrame(self, text="Global Scraper Options (Browser, Profile, Zoom & Timings)")
         self.opt_box = box
         box.columnconfigure(1, weight=1)
 
-        ttk.Label(box, text="Save folder:").grid(row=0, column=0, sticky="w", **pad)
-        ttk.Entry(box, textvariable=self.var_folder).grid(row=0, column=1, sticky="ew", **pad)
-        ttk.Button(box, text="Browse...", command=self.pick_folder).grid(row=0, column=2, **pad)
+        # Row 0: Save Folder
+        r0 = ttk.Frame(box)
+        r0.grid(row=0, column=0, columnspan=3, sticky="ew", **pad)
+        ttk.Label(r0, text="Save folder:").pack(side="left")
+        ttk.Entry(r0, textvariable=self.var_folder).pack(side="left", fill="x", expand=True, padx=6)
+        ttk.Button(r0, text="Browse...", command=self.pick_folder).pack(side="left")
 
-        drv_row = ttk.Frame(box)
-        drv_row.grid(row=1, column=0, columnspan=3, sticky="ew", **pad)
-        ttk.Checkbutton(drv_row, text="Use Real Chrome (Port:", variable=self.var_use_real_chrome, command=self.update_summary).pack(side="left")
-        ttk.Spinbox(drv_row, from_=9000, to=9999, width=6, textvariable=self.var_debug_port).pack(side="left", padx=4)
-        ttk.Label(drv_row, text=") chrome.exe:").pack(side="left")
-        ttk.Entry(drv_row, textvariable=self.var_chrome_exe, width=24).pack(side="left", fill="x", expand=True, padx=4)
-        ttk.Button(drv_row, text="Browse Chrome...", command=self.pick_chrome_exe).pack(side="left", padx=(0, 8))
-        ttk.Label(drv_row, text="chromedriver:").pack(side="left")
-        ttk.Entry(drv_row, textvariable=self.var_driver, width=20).pack(side="left", fill="x", expand=True, padx=4)
-        ttk.Button(drv_row, text="Browse...", command=self.pick_driver).pack(side="left")
+        # Row 1: Real Chrome + Port + chrome.exe + Profile Folder
+        r1 = ttk.Frame(box)
+        r1.grid(row=1, column=0, columnspan=3, sticky="ew", **pad)
+        ttk.Checkbutton(r1, text="Use Real Chrome (Port:", variable=self.var_use_real_chrome, command=self.update_summary).pack(side="left")
+        ttk.Spinbox(r1, from_=9000, to=9999, width=5, textvariable=self.var_debug_port).pack(side="left", padx=3)
+        ttk.Label(r1, text=")  Profile Dir:").pack(side="left")
+        ttk.Entry(r1, textvariable=self.var_chrome_profile, width=26).pack(side="left", fill="x", expand=True, padx=4)
+        ttk.Button(r1, text="Browse Profile...", command=self.pick_chrome_profile).pack(side="left", padx=(0, 8))
+        ttk.Label(r1, text="chrome.exe:").pack(side="left")
+        ttk.Entry(r1, textvariable=self.var_chrome_exe, width=18).pack(side="left", padx=4)
+        ttk.Button(r1, text="...", width=3, command=self.pick_chrome_exe).pack(side="left")
 
-        opts = ttk.Frame(box)
-        opts.grid(row=2, column=0, columnspan=3, sticky="w", **pad)
-        ttk.Label(opts, text="Page load wait (s):").pack(side="left")
-        ttk.Spinbox(opts, from_=1, to=120, width=5, textvariable=self.var_load_wait).pack(side="left", padx=(4, 14))
-        ttk.Label(opts, text="Step timeout (s):").pack(side="left")
-        ttk.Spinbox(opts, from_=1, to=120, width=5, textvariable=self.var_step_timeout).pack(side="left", padx=(4, 14))
-        ttk.Label(opts, text="Delay between steps (s):").pack(side="left")
-        ttk.Spinbox(opts, from_=0, to=60, increment=0.5, width=5, textvariable=self.var_step_delay).pack(side="left", padx=(4, 14))
-        ttk.Label(opts, text="Delay between URLs (s):").pack(side="left")
-        ttk.Spinbox(opts, from_=0, to=300, increment=0.5, width=5, textvariable=self.var_url_delay).pack(side="left", padx=(4, 14))
-        ttk.Label(opts, text="Workers (1-4):").pack(side="left")
-        ttk.Spinbox(opts, from_=1, to=4, width=4, textvariable=self.var_workers).pack(side="left", padx=(4, 0))
+        # Row 2: Timings + Zoom + Workers
+        r2 = ttk.Frame(box)
+        r2.grid(row=2, column=0, columnspan=3, sticky="w", **pad)
+        ttk.Label(r2, text="Load wait (s):").pack(side="left")
+        ttk.Spinbox(r2, from_=1, to=120, width=4, textvariable=self.var_load_wait).pack(side="left", padx=(3, 10))
+        ttk.Label(r2, text="Step timeout (s):").pack(side="left")
+        ttk.Spinbox(r2, from_=1, to=120, width=4, textvariable=self.var_step_timeout).pack(side="left", padx=(3, 10))
+        ttk.Label(r2, text="Step delay (s):").pack(side="left")
+        ttk.Spinbox(r2, from_=0, to=60, increment=0.5, width=4, textvariable=self.var_step_delay).pack(side="left", padx=(3, 10))
+        ttk.Label(r2, text="URL/Search delay (s):").pack(side="left")
+        ttk.Spinbox(r2, from_=0, to=300, increment=0.5, width=4, textvariable=self.var_url_delay).pack(side="left", padx=(3, 10))
+        ttk.Label(r2, text="Zoom (%):").pack(side="left")
+        ttk.Spinbox(r2, from_=25, to=200, increment=10, width=5, textvariable=self.var_zoom_pct).pack(side="left", padx=(3, 10))
+        ttk.Label(r2, text="Workers:").pack(side="left")
+        ttk.Spinbox(r2, from_=1, to=4, width=3, textvariable=self.var_workers).pack(side="left", padx=(3, 0))
 
-        checks = ttk.Frame(box)
-        checks.grid(row=3, column=0, columnspan=3, sticky="w", **pad)
-        ttk.Checkbutton(checks, text="Hidden Browser (Headless)", variable=self.var_headless).pack(side="left", padx=(0, 14))
-        ttk.Checkbutton(checks, text="One browser per worker", variable=self.var_browser_mode, onvalue="single", offvalue="each").pack(side="left", padx=(0, 14))
-        ttk.Checkbutton(checks, text="Stop loading early", variable=self.var_stop_loading).pack(side="left", padx=(0, 14))
-        ttk.Checkbutton(checks, text="Stealth mode", variable=self.var_stealth).pack(side="left", padx=(0, 14))
-        ttk.Checkbutton(checks, text="Resume previous", variable=self.var_resume).pack(side="left", padx=(0, 14))
-        ttk.Checkbutton(checks, text="Continue if step missing", variable=self.var_continue).pack(side="left")
+        # Row 3: Checkboxes + chromedriver
+        r3 = ttk.Frame(box)
+        r3.grid(row=3, column=0, columnspan=3, sticky="ew", **pad)
+        ttk.Checkbutton(r3, text="Close browser when finished", variable=self.var_close_on_finish).pack(side="left", padx=(0, 10))
+        ttk.Checkbutton(r3, text="Headless", variable=self.var_headless).pack(side="left", padx=(0, 10))
+        ttk.Checkbutton(r3, text="Reuse browser", variable=self.var_browser_mode, onvalue="single", offvalue="each").pack(side="left", padx=(0, 10))
+        ttk.Checkbutton(r3, text="Stop loading early", variable=self.var_stop_loading).pack(side="left", padx=(0, 10))
+        ttk.Checkbutton(r3, text="Stealth", variable=self.var_stealth).pack(side="left", padx=(0, 10))
+        ttk.Checkbutton(r3, text="Resume", variable=self.var_resume).pack(side="left", padx=(0, 10))
+        ttk.Checkbutton(r3, text="Continue if missing", variable=self.var_continue).pack(side="left")
 
         # ----- Site Profile Management Bar -----
         site_bar = ttk.LabelFrame(self, text="Site Profile, Per-Site Customization & Local Settings Backup")
-        site_bar.pack(fill="x", padx=10, pady=(6, 0))
+        site_bar.pack(fill="x", padx=10, pady=(4, 0))
         sb_in = ttk.Frame(site_bar)
-        sb_in.pack(fill="x", padx=8, pady=6)
+        sb_in.pack(fill="x", padx=8, pady=5)
 
         ttk.Label(sb_in, text="Active Site:").pack(side="left")
-        self.cmb_set = ttk.Combobox(sb_in, state="readonly", width=26)
+        self.cmb_set = ttk.Combobox(sb_in, state="readonly", width=24)
         self.cmb_set.pack(side="left", padx=(6, 6))
         self.cmb_set.bind("<<ComboboxSelected>>", self.on_set_selected)
 
         ttk.Button(sb_in, text="+ New site...", command=self.add_site).pack(side="left")
-        ttk.Button(sb_in, text="Rename site...", command=self.rename_site).pack(side="left", padx=4)
+        ttk.Button(sb_in, text="Rename...", command=self.rename_site).pack(side="left", padx=4)
         ttk.Button(sb_in, text="Site Options...", style="Accent.TButton", command=self.edit_site_options).pack(side="left", padx=4)
-        ttk.Button(sb_in, text="Delete site", command=self.delete_site).pack(side="left", padx=4)
+        ttk.Button(sb_in, text="Delete", command=self.delete_site).pack(side="left", padx=4)
 
         ttk.Button(sb_in, text="Import Settings", command=self.import_settings_file).pack(side="right", padx=(4, 0))
         ttk.Button(sb_in, text="Export Settings", command=self.export_settings_file).pack(side="right", padx=(8, 0))
@@ -821,23 +889,59 @@ class App(tk.Tk):
         main_pane = tk.PanedWindow(self, orient="vertical", **pane_opts)
         main_pane.pack(fill="both", expand=True, padx=10, pady=4)
         mid = tk.PanedWindow(main_pane, orient="horizontal", **pane_opts)
-        main_pane.add(mid, stretch="always", minsize=230)
+        main_pane.add(mid, stretch="always", minsize=240)
 
-        # 1. Links
-        links = ttk.LabelFrame(mid, text="1. Target URLs (Mix multiple sites freely)")
-        mid.add(links, stretch="always", minsize=280)
-        self.txt_links = scrolledtext.ScrolledText(links, height=10, width=36, wrap="none", **TEXT_OPTS)
-        self.txt_links.pack(fill="both", expand=True, padx=6, pady=6)
-        bar = ttk.Frame(links)
-        bar.pack(fill="x", padx=6, pady=(0, 6))
-        ttk.Button(bar, text="Load .txt", command=self.load_links_file).pack(side="left")
-        ttk.Button(bar, text="Auto-Detect Sites", command=self.auto_detect_sites).pack(side="left", padx=4)
-        ttk.Button(bar, text="Clear", command=lambda: self.txt_links.delete("1.0", "end")).pack(side="left")
-        self.lbl_count = ttk.Label(bar, text="0 links")
+        # 1. Left Pane: Mode Switcher (Direct URLs Mode vs Keyword Search Mode)
+        left_box = ttk.LabelFrame(mid, text="1. Input Source (Direct URLs vs Keyword Search Mode)")
+        mid.add(left_box, stretch="always", minsize=340)
+
+        mode_bar = ttk.Frame(left_box)
+        mode_bar.pack(fill="x", padx=6, pady=(5, 2))
+        ttk.Radiobutton(mode_bar, text="Direct URLs List", variable=self.var_input_mode, value="urls", command=self.switch_input_mode).pack(side="left", padx=(0, 12))
+        ttk.Radiobutton(mode_bar, text="Keyword Search Mode (Search Box)", variable=self.var_input_mode, value="search", command=self.switch_input_mode).pack(side="left")
+
+        # Frame A: Direct URLs
+        self.frm_urls = ttk.Frame(left_box)
+        self.txt_links = scrolledtext.ScrolledText(self.frm_urls, height=10, width=36, wrap="none", **TEXT_OPTS)
+        self.txt_links.pack(fill="both", expand=True, padx=6, pady=4)
+        bar_u = ttk.Frame(self.frm_urls)
+        bar_u.pack(fill="x", padx=6, pady=(0, 6))
+        ttk.Button(bar_u, text="Load .txt", command=self.load_links_file).pack(side="left")
+        ttk.Button(bar_u, text="Auto-Detect Sites", command=self.auto_detect_sites).pack(side="left", padx=4)
+        ttk.Button(bar_u, text="Clear", command=lambda: self.txt_links.delete("1.0", "end")).pack(side="left")
+        self.lbl_count = ttk.Label(bar_u, text="0 links")
         self.lbl_count.pack(side="right")
         self.txt_links.bind("<<Modified>>", self.on_links_modified)
 
-        # 2. Sequential Workflow
+        # Frame B: Keyword Search Mode
+        self.frm_search = ttk.Frame(left_box)
+        s_grid = ttk.Frame(self.frm_search)
+        s_grid.pack(fill="x", padx=6, pady=4)
+        s_grid.columnconfigure(1, weight=1)
+
+        ttk.Label(s_grid, text="Search Page URL:").grid(row=0, column=0, sticky="w", pady=2)
+        ttk.Entry(s_grid, textvariable=self.var_search_url).grid(row=0, column=1, columnspan=2, sticky="ew", padx=(4, 0), pady=2)
+
+        ttk.Label(s_grid, text="Search Input Box:").grid(row=1, column=0, sticky="w", pady=2)
+        ttk.Entry(s_grid, textvariable=self.var_search_input_sel).grid(row=1, column=1, sticky="ew", padx=4, pady=2)
+        self.btn_pick_search = ttk.Button(s_grid, text="Pick Box", command=lambda: self.toggle_record("searchbox"))
+        self.btn_pick_search.grid(row=1, column=2, pady=2)
+
+        ttk.Label(s_grid, text="Submit Btn (opt):").grid(row=2, column=0, sticky="w", pady=2)
+        ttk.Entry(s_grid, textvariable=self.var_search_btn_sel).grid(row=2, column=1, columnspan=2, sticky="ew", padx=(4, 0), pady=2)
+
+        ttk.Label(self.frm_search, text="Keywords / Part Numbers (one per line):").pack(anchor="w", padx=6)
+        self.txt_keywords = scrolledtext.ScrolledText(self.frm_search, height=6, width=36, wrap="none", **TEXT_OPTS)
+        self.txt_keywords.pack(fill="both", expand=True, padx=6, pady=4)
+        bar_k = ttk.Frame(self.frm_search)
+        bar_k.pack(fill="x", padx=6, pady=(0, 6))
+        ttk.Button(bar_k, text="Load Keywords .txt", command=self.load_keywords_file).pack(side="left")
+        ttk.Button(bar_k, text="Clear", command=lambda: self.txt_keywords.delete("1.0", "end")).pack(side="left", padx=4)
+        self.lbl_kw_count = ttk.Label(bar_k, text="0 keywords")
+        self.lbl_kw_count.pack(side="right")
+        self.txt_keywords.bind("<<Modified>>", self.on_kw_modified)
+
+        # 2. Right Pane: Sequential Workflow
         seq_box = ttk.LabelFrame(mid, text="2. Site Workflow (Drag & Drop rows to reorder)")
         mid.add(seq_box, stretch="always", minsize=560)
         self.lst_seq = tk.Listbox(seq_box, height=8, activestyle="none", exportselection=False, **LIST_OPTS)
@@ -852,17 +956,18 @@ class App(tk.Tk):
         self.btn_rec_click = ttk.Button(sr1, text="\u25CF Record Click", command=lambda: self.toggle_record("click"))
         self.btn_rec_click.pack(side="left")
         self.btn_rec_extract = ttk.Button(sr1, text="\u25CF Pick Extract Element", style="Accent.TButton", command=lambda: self.toggle_record("extract"))
-        self.btn_rec_extract.pack(side="left", padx=4)
-        ttk.Button(sr1, text="+ Set Page Size / Select", command=self.add_select_value_step).pack(side="left", padx=3)
+        self.btn_rec_extract.pack(side="left", padx=3)
+        ttk.Button(sr1, text="+ Set Select / Show All", command=self.add_select_value_step).pack(side="left", padx=3)
         ttk.Button(sr1, text="+ Manual Field", command=self.add_manual_extract).pack(side="left", padx=3)
+        ttk.Button(sr1, text="+ Zoom", command=self.add_zoom_step).pack(side="left", padx=3)
         ttk.Button(sr1, text="+ Wait", command=self.add_wait).pack(side="left")
 
         sr2 = ttk.Frame(seq_box)
         sr2.pack(fill="x", padx=6, pady=(2, 6))
         ttk.Button(sr2, text="Rename / Edit Val", command=self.rename_or_edit_seq).pack(side="left")
-        ttk.Button(sr2, text="Text / Link (href)", command=self.toggle_extract_attr).pack(side="left", padx=3)
+        ttk.Button(sr2, text="Text / Link / Both", command=self.toggle_extract_attr).pack(side="left", padx=3)
         ttk.Button(sr2, text="Single / Multi List", command=self.toggle_multi_mode).pack(side="left", padx=3)
-        ttk.Button(sr2, text="All Links / 1st Link Only", command=self.toggle_first_link_only).pack(side="left", padx=3)
+        ttk.Button(sr2, text="All / 1st Only", command=self.toggle_first_link_only).pack(side="left", padx=3)
         ttk.Button(sr2, text="Delete", command=self.delete_seq_item).pack(side="left", padx=3)
         ttk.Button(sr2, text="Up", width=3, command=lambda: self.move_seq(-1)).pack(side="left", padx=2)
         ttk.Button(sr2, text="Down", width=5, command=lambda: self.move_seq(1)).pack(side="left")
@@ -878,6 +983,15 @@ class App(tk.Tk):
         self.refresh_sequence()
         self.update_summary()
         self.set_options(True)
+
+    def switch_input_mode(self):
+        if self.var_input_mode.get() == "search":
+            self.frm_urls.pack_forget()
+            self.frm_search.pack(fill="both", expand=True)
+        else:
+            self.frm_search.pack_forget()
+            self.frm_urls.pack(fill="both", expand=True)
+        self.update_summary()
 
     # ----- Drag & Drop Handlers -----
     def on_drag_start(self, event):
@@ -915,8 +1029,8 @@ class App(tk.Tk):
             if bold:
                 s.configure(name, font=("Segoe UI", 10, "bold"))
 
-        flat_button("TButton", TAB, "#333333", "#DDDDDD", "#D0D0D0", "#F4F4F4", "#A8A8A8", (7, 4))
-        flat_button("Accent.TButton", BLUE, "white", BLUE_DARK, "#0A7DCC", "#A8D9FB", "white", (11, 5), bold=True)
+        flat_button("TButton", TAB, "#333333", "#DDDDDD", "#D0D0D0", "#F4F4F4", "#A8A8A8", (6, 4))
+        flat_button("Accent.TButton", BLUE, "white", BLUE_DARK, "#0A7DCC", "#A8D9FB", "white", (10, 5), bold=True)
         flat_button("Toolbar.TButton", NAVY, "#E6EAF2", NAVY_HOVER, "#2A3142", NAVY, "#7A859B", (12, 8))
 
         s.configure("Horizontal.TProgressbar", troughcolor="#D5DBE4", background=BLUE, thickness=10)
@@ -931,17 +1045,17 @@ class App(tk.Tk):
     def set_options(self, show):
         self.opt_visible = show
         if show:
-            self.opt_box.pack(fill="x", padx=10, pady=(8, 0), after=self.toolbar)
+            self.opt_box.pack(fill="x", padx=10, pady=(6, 0), after=self.toolbar)
         else:
             self.opt_box.pack_forget()
         self.btn_options.config(text=f"\u2630 Global Options {'\u25BE' if show else '\u25B8'}")
 
     def update_summary(self):
         extract_count = sum(1 for item in self.sequence if item["type"] == "extract")
-        sites_count = len([k for k in self.sequence_sets if k != ALL_SITES])
+        mode_lbl = "Search Mode" if self.var_input_mode.get() == "search" else "URLs Mode"
         engine_txt = f"Real Chrome (:{num(self.var_debug_port, 9222)})" if self.var_use_real_chrome.get() else "Auto ChromeDriver"
         self.lbl_summary.config(
-            text=f"Engine: {engine_txt}   \u00B7   Sites: {sites_count}   \u00B7   Steps: {len(self.sequence)} ({extract_count} fields)   \u00B7   Workers: {num(self.var_workers, 1)}"
+            text=f"Mode: {mode_lbl}   \u00B7   Engine: {engine_txt}   \u00B7   Zoom: {num(self.var_zoom_pct, 100)}%   \u00B7   Steps: {len(self.sequence)} ({extract_count} fields)"
         )
         if self.current_set == ALL_SITES:
             self.lbl_site_info.config(text="Using Global Options")
@@ -955,15 +1069,29 @@ class App(tk.Tk):
         hosts = {host_of(u) for u in links if host_of(u)}
         self.lbl_count.config(text=f"{len(links)} links ({len(hosts)} domains)")
 
+    def update_kw_count(self):
+        kws = self.get_keywords()
+        self.lbl_kw_count.config(text=f"{len(kws)} keywords")
+
     def on_links_modified(self, _event=None):
         if self.txt_links.edit_modified():
             self.update_link_count()
             self.txt_links.edit_modified(False)
 
+    def on_kw_modified(self, _event=None):
+        if self.txt_keywords.edit_modified():
+            self.update_kw_count()
+            self.txt_keywords.edit_modified(False)
+
     def get_links(self, dedupe=True):
         raw = self.txt_links.get("1.0", "end").splitlines()
         links = [x.strip() for x in raw if x.strip()]
         return list(dict.fromkeys(links)) if (dedupe and self.var_dedupe.get()) else links
+
+    def get_keywords(self, dedupe=True):
+        raw = self.txt_keywords.get("1.0", "end").splitlines()
+        kws = [x.strip() for x in raw if x.strip()]
+        return list(dict.fromkeys(kws)) if (dedupe and self.var_dedupe.get()) else kws
 
     def auto_detect_sites(self):
         links = self.get_links()
@@ -982,15 +1110,17 @@ class App(tk.Tk):
         if d:
             self.var_folder.set(d)
 
+    def pick_chrome_profile(self):
+        local_chrome = os.path.join(os.environ.get("LOCALAPPDATA", ""), "Google", "Chrome", "User Data")
+        init_dir = local_chrome if os.path.isdir(local_chrome) else None
+        d = filedialog.askdirectory(title="Choose Chrome Profile Folder (e.g. Default or Profile 1)", initialdir=init_dir)
+        if d:
+            self.var_chrome_profile.set(d)
+
     def pick_chrome_exe(self):
         f = filedialog.askopenfilename(title="Choose chrome.exe", filetypes=[("Chrome Executable", "chrome.exe"), ("All files", "*.*")])
         if f:
             self.var_chrome_exe.set(f)
-
-    def pick_driver(self):
-        f = filedialog.askopenfilename(title="Choose chromedriver", filetypes=[("chromedriver", "*.exe"), ("All files", "*.*")])
-        if f:
-            self.var_driver.set(f)
 
     def load_links_file(self):
         f = filedialog.askopenfilename(title="Choose links file", filetypes=[("Text files", "*.txt"), ("All files", "*.*")])
@@ -998,6 +1128,13 @@ class App(tk.Tk):
             with open(f, encoding="utf-8", errors="ignore") as fh:
                 self.txt_links.delete("1.0", "end")
                 self.txt_links.insert("1.0", fh.read())
+
+    def load_keywords_file(self):
+        f = filedialog.askopenfilename(title="Choose keywords file", filetypes=[("Text files", "*.txt"), ("All files", "*.*")])
+        if f:
+            with open(f, encoding="utf-8", errors="ignore") as fh:
+                self.txt_keywords.delete("1.0", "end")
+                self.txt_keywords.insert("1.0", fh.read())
 
     def open_folder(self):
         folder = self.var_folder.get().strip()
@@ -1030,12 +1167,14 @@ class App(tk.Tk):
                     if k not in field_names:
                         field_names.append(k)
 
-            header = ["Page Link", "Page Title", "Row #", "Status", "Notes", "Timestamp"] + field_names
+            header = ["Keyword", "Input Link", "Final URL", "Page Title", "Row #", "Status", "Notes", "Timestamp"] + field_names
             rows = [header]
             for r in records:
                 fdict = r.get("fields", {})
                 row = [
+                    r.get("keyword", ""),
                     r.get("link", ""),
+                    r.get("final_url", r.get("link", "")),
                     r.get("title", ""),
                     r.get("row_index", 1),
                     r.get("status", ""),
@@ -1124,6 +1263,7 @@ class App(tk.Tk):
         v_tout = tk.DoubleVar(value=cur.get("step_timeout", num(self.var_step_timeout, 10)))
         v_sdel = tk.DoubleVar(value=cur.get("step_delay", num(self.var_step_delay, 1.5)))
         v_udel = tk.DoubleVar(value=cur.get("url_delay", num(self.var_url_delay, 0)))
+        v_zoom = tk.IntVar(value=cur.get("zoom_pct", num(self.var_zoom_pct, 100)))
         v_head = tk.BooleanVar(value=cur.get("headless", self.var_headless.get()))
         v_stel = tk.BooleanVar(value=cur.get("stealth", self.var_stealth.get()))
         v_stop = tk.BooleanVar(value=cur.get("stop_loading", self.var_stop_loading.get()))
@@ -1135,7 +1275,7 @@ class App(tk.Tk):
         ttk.Label(dlg, text="Page load wait (s):").grid(row=1, column=0, sticky="w", **pad)
         ttk.Spinbox(dlg, from_=1, to=120, width=8, textvariable=v_load).grid(row=1, column=1, sticky="w", **pad)
 
-        ttk.Label(dlg, text="Step element timeout (s):").grid(row=2, column=0, sticky="w", **pad)
+        ttk.Label(dlg, text="Step timeout (s):").grid(row=2, column=0, sticky="w", **pad)
         ttk.Spinbox(dlg, from_=1, to=120, width=8, textvariable=v_tout).grid(row=2, column=1, sticky="w", **pad)
 
         ttk.Label(dlg, text="Delay between steps (s):").grid(row=3, column=0, sticky="w", **pad)
@@ -1144,11 +1284,14 @@ class App(tk.Tk):
         ttk.Label(dlg, text="Delay between URLs (s):").grid(row=4, column=0, sticky="w", **pad)
         ttk.Spinbox(dlg, from_=0, to=300, increment=0.5, width=8, textvariable=v_udel).grid(row=4, column=1, sticky="w", **pad)
 
-        ttk.Checkbutton(dlg, text="Use Real Chrome Browser Directly", variable=v_real).grid(row=5, column=0, columnspan=2, sticky="w", **pad)
-        ttk.Checkbutton(dlg, text="Hidden Browser (Headless)", variable=v_head).grid(row=6, column=0, columnspan=2, sticky="w", **pad)
-        ttk.Checkbutton(dlg, text="Stealth Mode (Anti-Bot)", variable=v_stel).grid(row=7, column=0, columnspan=2, sticky="w", **pad)
-        ttk.Checkbutton(dlg, text="Stop loading early", variable=v_stop).grid(row=8, column=0, columnspan=2, sticky="w", **pad)
-        ttk.Checkbutton(dlg, text="Reopen fresh browser for every URL", variable=v_newb).grid(row=9, column=0, columnspan=2, sticky="w", **pad)
+        ttk.Label(dlg, text="Page Zoom (%):").grid(row=5, column=0, sticky="w", **pad)
+        ttk.Spinbox(dlg, from_=25, to=200, increment=10, width=8, textvariable=v_zoom).grid(row=5, column=1, sticky="w", **pad)
+
+        ttk.Checkbutton(dlg, text="Use Real Chrome Browser Directly", variable=v_real).grid(row=6, column=0, columnspan=2, sticky="w", **pad)
+        ttk.Checkbutton(dlg, text="Hidden Browser (Headless)", variable=v_head).grid(row=7, column=0, columnspan=2, sticky="w", **pad)
+        ttk.Checkbutton(dlg, text="Stealth Mode (Anti-Bot)", variable=v_stel).grid(row=8, column=0, columnspan=2, sticky="w", **pad)
+        ttk.Checkbutton(dlg, text="Stop loading early", variable=v_stop).grid(row=9, column=0, columnspan=2, sticky="w", **pad)
+        ttk.Checkbutton(dlg, text="Reopen fresh browser for every URL", variable=v_newb).grid(row=10, column=0, columnspan=2, sticky="w", **pad)
 
         def save_site_opts():
             if not v_use.get():
@@ -1160,6 +1303,7 @@ class App(tk.Tk):
                     "step_timeout": float(v_tout.get()),
                     "step_delay": float(v_sdel.get()),
                     "url_delay": float(v_udel.get()),
+                    "zoom_pct": int(v_zoom.get()),
                     "headless": bool(v_head.get()),
                     "stealth": bool(v_stel.get()),
                     "stop_loading": bool(v_stop.get()),
@@ -1169,7 +1313,7 @@ class App(tk.Tk):
             self.update_summary()
 
         btns = ttk.Frame(dlg)
-        btns.grid(row=10, column=0, columnspan=2, sticky="e", padx=12, pady=10)
+        btns.grid(row=11, column=0, columnspan=2, sticky="e", padx=12, pady=10)
         ttk.Button(btns, text="Save", style="Accent.TButton", command=save_site_opts).pack(side="left")
         ttk.Button(btns, text="Cancel", command=dlg.destroy).pack(side="left", padx=6)
         dlg.grab_set()
@@ -1179,22 +1323,30 @@ class App(tk.Tk):
         self.lst_seq.delete(0, "end")
         for n, item in enumerate(self.sequence, 1):
             t = item["type"]
-            scope_tag = " [1ST LINK ONLY]" if item.get("first_link_only") else ""
+            scope_tag = " [1ST ONLY]" if item.get("first_link_only") else ""
             if t == "wait":
                 txt = f"{n}.{scope_tag} [WAIT] {item['seconds']:g} s"
+            elif t == "zoom":
+                txt = f"{n}.{scope_tag} [ZOOM] {item['zoom']}%"
             elif t == "click":
                 txt = f"{n}.{scope_tag} [CLICK] -> {item['selector']}"
             elif t == "select_value":
                 txt = f"{n}.{scope_tag} [SET SELECT = '{item['value']}'] -> {item['selector']}"
             elif t == "extract":
-                mode_tag = "MULTI-LIST" if item.get("multi") else "SINGLE"
-                attr_map = {"text": "TEXT", "href": "LINK (href)", "both": "TEXT + LINK"}
+                mode_tag = "MULTI" if item.get("multi") else "SINGLE"
+                attr_map = {"text": "TEXT", "href": "LINK", "both": "TEXT + LINK (2 Cols)"}
                 attr_tag = attr_map.get(item.get("extract_attr", "text"), "TEXT")
                 txt = f"{n}.{scope_tag} [EXTRACT {attr_tag} | {mode_tag}: {item['name']}] -> {item['selector']}"
             self.lst_seq.insert("end", txt)
         if select is not None and 0 <= select < len(self.sequence):
             self.lst_seq.selection_set(select)
         self.update_summary()
+
+    def add_zoom_step(self):
+        z = simpledialog.askinteger("Page Zoom", "Enter Zoom percentage (e.g. 50, 75, 100, 125):", initialvalue=75, minvalue=25, maxvalue=200, parent=self)
+        if z:
+            self.sequence.append({"type": "zoom", "zoom": z, "first_link_only": False})
+            self.refresh_sequence(select=len(self.sequence) - 1)
 
     def add_select_value_step(self):
         sel = simpledialog.askstring(
@@ -1207,7 +1359,7 @@ class App(tk.Tk):
             return
         val = simpledialog.askstring(
             "Target Value",
-            "Enter value to select or inject (e.g. 100, 1000, 2000):",
+            "Enter text or number to select/inject (e.g. Show All, All, 100, 2000):",
             initialvalue="2000",
             parent=self,
         )
@@ -1260,20 +1412,21 @@ class App(tk.Tk):
         self.refresh_sequence(select=idx)
 
     def add_manual_extract(self):
-        name = simpledialog.askstring("Field Name", "Column Name (e.g. Part Number, Datasheet Link):", parent=self)
+        name = simpledialog.askstring("Field Name", "Column Name (e.g. Part Number, Datasheet):", parent=self)
         if not name or not name.strip():
             return
         sel = simpledialog.askstring("Selector", f"CSS or xpath= selector for '{name.strip()}':", parent=self)
         if not sel or not sel.strip():
             return
         is_multi = messagebox.askyesno("Extraction Mode", "Does this selector match MULTIPLE repeating items on the same page?")
-        is_link = messagebox.askyesno("Data Type", "Do you want to extract the LINK (href) instead of visible text?")
+        is_both = messagebox.askyesno("Data Type", "Extract BOTH Text and Link into 2 separate columns?")
+        attr = "both" if is_both else ("href" if messagebox.askyesno("Link Only", "Extract LINK (href) only?") else "text")
         self.sequence.append({
             "type": "extract",
             "name": name.strip(),
             "selector": sel.strip(),
             "multi": is_multi,
-            "extract_attr": "href" if is_link else "text",
+            "extract_attr": attr,
             "first_link_only": False,
         })
         self.refresh_sequence(select=len(self.sequence) - 1)
@@ -1317,9 +1470,14 @@ class App(tk.Tk):
                 item["name"] = new_name.strip()
                 self.refresh_sequence(select=idx)
         elif item["type"] == "select_value":
-            new_val = simpledialog.askstring("Edit Select Value", "New target value (e.g. 100, 1000, 2000):", initialvalue=item["value"], parent=self)
+            new_val = simpledialog.askstring("Edit Select Value", "New target value (e.g. Show All, 100, 2000):", initialvalue=item["value"], parent=self)
             if new_val and new_val.strip():
                 item["value"] = new_val.strip()
+                self.refresh_sequence(select=idx)
+        elif item["type"] == "zoom":
+            new_z = simpledialog.askinteger("Edit Zoom", "New Zoom %:", initialvalue=item["zoom"], minvalue=25, maxvalue=200, parent=self)
+            if new_z:
+                item["zoom"] = new_z
                 self.refresh_sequence(select=idx)
 
     # ----- Visual Picker -----
@@ -1327,17 +1485,21 @@ class App(tk.Tk):
         if self.rec_mode is not None:
             self.rec_stop.set()
             return
-        links = self.get_links()
-        if self.current_set != ALL_SITES:
-            matched = [u for u in links if host_matches(host_of(u), self.current_set)]
-            if matched:
-                url = matched[0]
-            elif "." in self.current_set:
-                url = "https://" + self.current_set
+
+        if self.var_input_mode.get() == "search" and self.var_search_url.get().strip():
+            url = self.var_search_url.get().strip()
+        else:
+            links = self.get_links()
+            if self.current_set != ALL_SITES:
+                matched = [u for u in links if host_matches(host_of(u), self.current_set)]
+                if matched:
+                    url = matched[0]
+                elif "." in self.current_set:
+                    url = "https://" + self.current_set
+                else:
+                    url = links[0] if links else simpledialog.askstring("Sample URL", "Enter full URL to open:", parent=self)
             else:
                 url = links[0] if links else simpledialog.askstring("Sample URL", "Enter full URL to open:", parent=self)
-        else:
-            url = links[0] if links else simpledialog.askstring("Sample URL", "Enter full URL to open:", parent=self)
 
         if not url:
             return
@@ -1349,6 +1511,8 @@ class App(tk.Tk):
         if mode == "click":
             self.btn_rec_click.config(text="\u25A0 Stop Click Rec")
             self.btn_rec_extract.config(state="disabled")
+        elif mode == "searchbox":
+            self.btn_pick_search.config(text="\u25A0 Stop")
         else:
             self.btn_rec_extract.config(text="\u25A0 Stop Picking")
             self.btn_rec_click.config(state="disabled")
@@ -1356,6 +1520,7 @@ class App(tk.Tk):
         rec_cfg = {
             "driver": self.var_driver.get().strip(),
             "chrome_exe": self.var_chrome_exe.get().strip(),
+            "chrome_profile": self.var_chrome_profile.get().strip(),
             "use_real_chrome": self.var_use_real_chrome.get(),
             "debug_port": num(self.var_debug_port, 9222),
             "stealth": self.var_stealth.get(),
@@ -1381,7 +1546,12 @@ class App(tk.Tk):
 
             if is_real:
                 port = int(rec_cfg.get("debug_port", 9222))
-                ok, msg = launch_real_chrome(port=port, headless=False, chrome_path=rec_cfg.get("chrome_exe", ""))
+                ok, msg = launch_real_chrome(
+                    port=port,
+                    headless=False,
+                    chrome_path=rec_cfg.get("chrome_exe", ""),
+                    custom_profile=rec_cfg.get("chrome_profile", ""),
+                )
                 self.msg_queue.put(("log", msg))
                 if not ok:
                     return
@@ -1442,12 +1612,16 @@ class App(tk.Tk):
                     self.btn_rec_extract.config(state="normal")
                 elif kind == "rec_event":
                     m = data.get("type")
-                    if m == "click":
+                    if m == "searchbox":
+                        self.var_search_input_sel.set(data["selector"])
+                        self.rec_stop.set()
+                        self.log(f"Picked Search Box: {data['selector']}")
+                    elif m == "click":
                         if data.get("is_select"):
                             val = simpledialog.askstring(
                                 "Dropdown Detected (<select>)",
                                 f"You clicked a dropdown: {data['selector']}\n\n"
-                                f"Enter the value you want to select or inject (e.g. 100, 1000, 2000):",
+                                f"Enter the text or value to select/inject (e.g. Show All, 100, 2000):",
                                 initialvalue="2000",
                                 parent=self,
                             )
@@ -1463,7 +1637,7 @@ class App(tk.Tk):
 
                         first_only = messagebox.askyesno(
                             "Click Scope",
-                            f"Recorded Click: {data['selector']}\n\nRun this click on the FIRST link of this domain only (e.g. Cookie banner)?\n(Click 'No' to run on ALL links)"
+                            f"Recorded Click: {data['selector']}\n\nRun this click on the FIRST item only (e.g. Cookie banner)?\n(Click 'No' to run on ALL items)"
                         )
                         self.sequence.append({
                             "type": "click",
@@ -1492,12 +1666,15 @@ class App(tk.Tk):
 
                         extract_attr = "text"
                         if data.get("sample_href"):
-                            want_link = messagebox.askyesno(
+                            want_both = messagebox.askyesno(
                                 "Link Detected (href)",
                                 f"This element contains a link:\n{data['sample_href']}\n\n"
-                                f"Do you want to extract the LINK URL (href) instead of the text?"
+                                f"Extract BOTH Text AND Link into 2 separate columns?\n"
+                                f"(Click 'No' to choose Text only or Link only)"
                             )
-                            if want_link:
+                            if want_both:
+                                extract_attr = "both"
+                            elif messagebox.askyesno("Link Only", "Extract ONLY the Link URL (href)?"):
                                 extract_attr = "href"
 
                         self.sequence.append({
@@ -1514,6 +1691,7 @@ class App(tk.Tk):
                     self.rec_mode = None
                     self.btn_rec_click.config(text="\u25CF Record Click", state="normal")
                     self.btn_rec_extract.config(text="\u25CF Pick Extract Element", state="normal")
+                    self.btn_pick_search.config(text="Pick Box", state="normal")
         except queue.Empty:
             pass
         self.after(100, self.poll_queue)
@@ -1533,17 +1711,48 @@ class App(tk.Tk):
     # ----- Execution Engine -----
     def build_cfg(self):
         folder = self.var_folder.get().strip()
-        links = self.get_links()
-        if not folder or not links:
-            messagebox.showwarning("Warning", "Please specify save folder and target URLs.")
+        mode = self.var_input_mode.get()
+        if not folder:
+            messagebox.showwarning("Warning", "Please specify save folder.")
             return None
+
+        tasks = []
+        if mode == "search":
+            s_url = self.var_search_url.get().strip()
+            s_box = self.var_search_input_sel.get().strip()
+            kws = self.get_keywords()
+            if not s_url or not s_box or not kws:
+                messagebox.showwarning("Warning", "In Search Mode, please enter Search Page URL, Search Input Box selector, and at least 1 keyword.")
+                return None
+            if not s_url.startswith(("http://", "https://")):
+                s_url = "https://" + s_url
+            for idx, kw in enumerate(kws):
+                tasks.append({"link": s_url, "keyword": kw, "is_first": idx == 0})
+        else:
+            links = self.get_links()
+            if not links:
+                messagebox.showwarning("Warning", "Please enter target URLs.")
+                return None
+            seen_domains = set()
+            for l in links:
+                dom = host_of(l)
+                is_first = dom not in seen_domains
+                seen_domains.add(dom)
+                tasks.append({"link": l, "keyword": "", "is_first": is_first})
+
         os.makedirs(folder, exist_ok=True)
-        return links, {
+        return tasks, {
             "folder": os.path.abspath(folder),
+            "input_mode": mode,
+            "search_input_sel": self.var_search_input_sel.get().strip(),
+            "search_btn_sel": self.var_search_btn_sel.get().strip(),
             "driver": self.var_driver.get().strip(),
             "chrome_exe": self.var_chrome_exe.get().strip(),
+            "chrome_profile": self.var_chrome_profile.get().strip(),
             "use_real_chrome": self.var_use_real_chrome.get(),
             "debug_port": num(self.var_debug_port, 9222),
+            "close_on_finish": self.var_close_on_finish.get(),
+            "zoom_pct": num(self.var_zoom_pct, 100),
             "load_wait": num(self.var_load_wait, 5),
             "stop_loading": self.var_stop_loading.get(),
             "step_timeout": num(self.var_step_timeout, 10),
@@ -1566,15 +1775,15 @@ class App(tk.Tk):
         built = self.build_cfg()
         if not built:
             return
-        links, cfg = built
+        tasks, cfg = built
         self.save_settings()
         self.stop_event.clear()
         self.btn_start.config(state="disabled")
         self.btn_rec_click.config(state="disabled")
         self.btn_rec_extract.config(state="disabled")
         self.btn_stop.config(state="normal")
-        self.msg_queue.put(("progress", (0, len(links))))
-        self.worker = threading.Thread(target=self.run_job, args=(links, cfg), daemon=True)
+        self.msg_queue.put(("progress", (0, len(tasks))))
+        self.worker = threading.Thread(target=self.run_job, args=(tasks, cfg), daemon=True)
         self.worker.start()
 
     def test_first(self):
@@ -1583,27 +1792,32 @@ class App(tk.Tk):
         built = self.build_cfg()
         if not built:
             return
-        links, cfg = built
+        tasks, cfg = built
         self.save_settings()
-        threading.Thread(target=self.run_test, args=(links[0], cfg), daemon=True).start()
+        threading.Thread(target=self.run_test, args=(tasks[0], cfg), daemon=True).start()
 
-    def run_test(self, link, cfg):
+    def run_test(self, task, cfg):
         q = self.msg_queue
+        link = task["link"]
+        kw = task["keyword"]
         site_key = resolve_site_key(cfg["sequence_sets"], link)
         scfg = apply_site_cfg(cfg, link)
         seq = cfg["sequence_sets"].get(site_key, [])
-        q.put(("log", f"TEST [{site_key}] (First Link) on: {link}"))
+        q.put(("log", f"TEST [{site_key}] {f'(Keyword: {kw}) ' if kw else ''}on: {link}"))
         driver = None
         try:
             driver = self.new_driver(scfg, worker_idx=0)
-            page_title, rows_data, status, note = self.execute_sequence(driver, link, scfg, seq, is_first_in_domain=True)
-            q.put(("log", f"   Page Title: {page_title} | Extracted Rows: {len(rows_data)}"))
+            final_url, page_title, rows_data, status, note = self.execute_task(
+                driver, link, kw, scfg, seq, is_first_in_domain=True, reload_page=True
+            )
+            q.put(("log", f"   Final URL: {final_url}"))
+            q.put(("log", f"   Title: {page_title} | Extracted Rows: {len(rows_data)}"))
             for r_idx, fdict in enumerate(rows_data[:10], 1):
                 q.put(("log", f"   Row {r_idx}: {json.dumps(fdict, ensure_ascii=False)}"))
         except Exception as e:
             q.put(("log", f"   Error: {e}"))
         finally:
-            self.close_driver(driver, is_real_chrome=scfg.get("use_real_chrome"))
+            self.close_driver(driver, is_real_chrome=scfg.get("use_real_chrome"), force_close=scfg.get("close_on_finish"))
 
     def stop(self):
         self.stop_event.set()
@@ -1619,6 +1833,7 @@ class App(tk.Tk):
                 port=port,
                 headless=scfg.get("headless", False),
                 chrome_path=scfg.get("chrome_exe", ""),
+                custom_profile=scfg.get("chrome_profile", ""),
             )
             self.msg_queue.put(("log", f"   {msg}"))
             if not ok:
@@ -1640,22 +1855,59 @@ class App(tk.Tk):
         self.live_drivers.add(driver)
         return driver
 
-    def close_driver(self, driver, is_real_chrome=False):
+    def close_driver(self, driver, is_real_chrome=False, force_close=False):
         if driver:
             self.live_drivers.discard(driver)
             try:
-                if not is_real_chrome:
+                if not is_real_chrome or force_close:
                     driver.quit()
             except Exception:
                 pass
 
-    def execute_sequence(self, driver, link, scfg, sequence, is_first_in_domain=False):
-        driver.get(link)
-        time.sleep(scfg["load_wait"])
-        if scfg["stop_loading"]:
-            driver.execute_script("window.stop();")
+    def execute_task(self, driver, link, keyword, scfg, sequence, is_first_in_domain=False, reload_page=True):
+        if reload_page or not keyword:
+            driver.get(link)
+            time.sleep(scfg["load_wait"])
+            if scfg["stop_loading"]:
+                driver.execute_script("window.stop();")
 
-        page_title = driver.title.strip()
+        apply_zoom(driver, scfg.get("zoom_pct", 100))
+
+        # إذا كان الوضع Search Mode، نكتب الكلمة المفتاحية في مربع البحث ونضغط Enter أو زر البحث
+        if keyword:
+            by_s, val_s = parse_selector(scfg["search_input_sel"])
+            try:
+                s_els = WebDriverWait(driver, scfg["step_timeout"]).until(lambda d: d.find_elements(by_s, val_s) or False)
+            except TimeoutException:
+                s_els = []
+            if not s_els:
+                raise RuntimeError(f"Search input box not found: {scfg['search_input_sel']}")
+            s_box = ([e for e in s_els if is_displayed(e)] or s_els)[0]
+            click_element(driver, s_box)
+            try:
+                s_box.clear()
+            except Exception:
+                pass
+            s_box.send_keys(Keys.CONTROL, "a")
+            s_box.send_keys(Keys.BACKSPACE)
+            s_box.send_keys(keyword)
+
+            btn_sel = scfg.get("search_btn_sel", "").strip()
+            if btn_sel:
+                by_b, val_b = parse_selector(btn_sel)
+                b_els = driver.find_elements(by_b, val_b)
+                if b_els:
+                    click_element(driver, ([e for e in b_els if is_displayed(e)] or b_els)[0])
+                else:
+                    s_box.send_keys(Keys.ENTER)
+            else:
+                s_box.send_keys(Keys.ENTER)
+
+            time.sleep(scfg["load_wait"])
+            if scfg["stop_loading"]:
+                driver.execute_script("window.stop();")
+            apply_zoom(driver, scfg.get("zoom_pct", 100))
+
         single_fields = {}
         multi_fields = {}
 
@@ -1666,6 +1918,8 @@ class App(tk.Tk):
             t = item["type"]
             if t == "wait":
                 time.sleep(item["seconds"])
+            elif t == "zoom":
+                apply_zoom(driver, item["zoom"])
             elif t == "click":
                 by, val = parse_selector(item["selector"])
                 try:
@@ -1700,17 +1954,40 @@ class App(tk.Tk):
             elif t == "extract":
                 by, val = parse_selector(item["selector"])
                 attr_mode = item.get("extract_attr", "text")
+                col_name = item["name"]
+                link_col_name = f"{col_name}_Link"
+
                 try:
                     els = driver.find_elements(by, val)
-                    vals = [extract_element_value(e, attr_mode) for e in els]
-                    vals = [v for v in vals if v]
+                    pairs = [extract_element_pair(e) for e in els]
                 except Exception:
-                    vals = []
+                    pairs = []
 
                 if item.get("multi"):
-                    multi_fields[item["name"]] = vals
+                    if attr_mode == "text":
+                        multi_fields[col_name] = [p[0] for p in pairs if p[0]]
+                    elif attr_mode == "href":
+                        multi_fields[col_name] = [p[1] for p in pairs if p[1]]
+                    elif attr_mode == "both":
+                        valid_pairs = [p for p in pairs if p[0] or p[1]]
+                        multi_fields[col_name] = [p[0] for p in valid_pairs]
+                        multi_fields[link_col_name] = [p[1] for p in valid_pairs]
                 else:
-                    single_fields[item["name"]] = " | ".join(vals) if vals else ""
+                    if attr_mode == "text":
+                        single_fields[col_name] = " | ".join(p[0] for p in pairs if p[0])
+                    elif attr_mode == "href":
+                        single_fields[col_name] = " | ".join(p[1] for p in pairs if p[1])
+                    elif attr_mode == "both":
+                        single_fields[col_name] = " | ".join(p[0] for p in pairs if p[0])
+                        single_fields[link_col_name] = " | ".join(p[1] for p in pairs if p[1])
+
+        final_url = ""
+        page_title = ""
+        try:
+            final_url = driver.current_url.strip()
+            page_title = driver.title.strip()
+        except Exception:
+            pass
 
         max_rows = max((len(v) for v in multi_fields.values()), default=1)
         max_rows = max(1, max_rows)
@@ -1722,16 +1999,20 @@ class App(tk.Tk):
                 row_dict[fname] = vlist[idx] if idx < len(vlist) else ""
             rows_output.append(row_dict)
 
-        return page_title, rows_output, "OK", ""
+        return final_url, page_title, rows_output, "OK", ""
 
     def worker_loop(self, task_q, cfg, ctx, worker_idx=0):
-        holder = {"d": None, "sig": None, "real": False}
+        holder = {"d": None, "sig": None, "real": False, "last_url": None}
         try:
             while not self.stop_event.is_set():
                 try:
-                    i, link, is_first_domain = task_q.get_nowait()
+                    i, task = task_q.get_nowait()
                 except queue.Empty:
                     break
+
+                link = task["link"]
+                kw = task["keyword"]
+                is_first_domain = task["is_first"]
 
                 site_key = resolve_site_key(cfg["sequence_sets"], link)
                 scfg = apply_site_cfg(cfg, link)
@@ -1739,13 +2020,14 @@ class App(tk.Tk):
                 driver_sig = (scfg.get("headless"), scfg.get("stealth"), scfg.get("use_real_chrome"))
 
                 if holder["d"] is not None and holder["sig"] != driver_sig:
-                    self.close_driver(holder["d"], is_real_chrome=holder["real"])
+                    self.close_driver(holder["d"], is_real_chrome=holder["real"], force_close=True)
                     holder["d"] = None
+                    holder["last_url"] = None
 
-                tag_1st = " [1st in Domain]" if is_first_domain else ""
-                self.msg_queue.put(("log", f"[{i + 1}/{ctx['total']}] ({site_key}){tag_1st} {link}"))
+                label = f"[KW: {kw}] {link}" if kw else link
+                self.msg_queue.put(("log", f"[{i + 1}/{ctx['total']}] ({site_key}) {label}"))
 
-                page_title, rows_data, status, note = "", [{}], "Error", ""
+                final_url, page_title, rows_data, status, note = link, "", [{}], "Error", ""
                 for attempt in range(1, cfg["retries"] + 2):
                     if self.stop_event.is_set():
                         break
@@ -1754,29 +2036,39 @@ class App(tk.Tk):
                             holder["d"] = self.new_driver(scfg, worker_idx=worker_idx)
                             holder["sig"] = driver_sig
                             holder["real"] = bool(scfg.get("use_real_chrome"))
-                        page_title, rows_data, status, note = self.execute_sequence(
-                            holder["d"], link, scfg, seq, is_first_in_domain=is_first_domain
+                            holder["last_url"] = None
+
+                        need_reload = (not kw) or (holder["last_url"] != link) or (attempt > 1)
+                        final_url, page_title, rows_data, status, note = self.execute_task(
+                            holder["d"], link, kw, scfg, seq,
+                            is_first_in_domain=is_first_domain,
+                            reload_page=need_reload,
                         )
+                        holder["last_url"] = link
                         break
                     except Exception as e:
                         note = str(e).splitlines()[0] if str(e) else type(e).__name__
                         self.msg_queue.put(("log", f"   Attempt {attempt} error: {note}"))
                         if holder["d"]:
-                            self.close_driver(holder["d"], is_real_chrome=holder["real"])
+                            self.close_driver(holder["d"], is_real_chrome=holder["real"], force_close=True)
                             holder["d"] = None
+                            holder["last_url"] = None
                     if attempt <= cfg["retries"] and not self.stop_event.is_set():
                         time.sleep(2)
 
                 if scfg.get("new_browser") and holder["d"]:
-                    self.close_driver(holder["d"], is_real_chrome=holder["real"])
+                    self.close_driver(holder["d"], is_real_chrome=holder["real"], force_close=True)
                     holder["d"] = None
+                    holder["last_url"] = None
 
                 ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 with ctx["lock"]:
                     for r_idx, fdict in enumerate(rows_data, 1):
                         rec = {
                             "site_profile": site_key if site_key != ALL_SITES else (host_of(link) or "General"),
+                            "keyword": kw,
                             "link": link,
+                            "final_url": final_url,
                             "title": page_title,
                             "row_index": r_idx,
                             "status": status,
@@ -1792,14 +2084,18 @@ class App(tk.Tk):
                 if scfg.get("url_delay", 0) > 0 and not self.stop_event.is_set():
                     time.sleep(scfg["url_delay"])
         finally:
-            self.close_driver(holder["d"], is_real_chrome=holder["real"])
+            self.close_driver(
+                holder["d"],
+                is_real_chrome=holder["real"],
+                force_close=cfg.get("close_on_finish", False),
+            )
 
-    def run_job(self, links, cfg):
+    def run_job(self, tasks, cfg):
         q = self.msg_queue
-        total = len(links)
+        total = len(tasks)
         out_path = os.path.join(cfg["folder"], "Scraped_Results.jsonl")
 
-        done_links = set()
+        done_keys = set()
         if cfg["resume"] and os.path.exists(out_path):
             with open(out_path, encoding="utf-8") as f:
                 for line in f:
@@ -1808,20 +2104,15 @@ class App(tk.Tk):
                     try:
                         rec = json.loads(line)
                         if rec.get("status") == "OK":
-                            done_links.add(rec.get("link"))
+                            done_keys.add((rec.get("link", ""), rec.get("keyword", "")))
                     except Exception:
                         pass
 
-        seen_domains = set()
         todo = []
-        for i, l in enumerate(links):
-            if l in done_links:
-                seen_domains.add(host_of(l))
+        for i, t in enumerate(tasks):
+            if (t["link"], t["keyword"]) in done_keys:
                 continue
-            dom = host_of(l)
-            is_first = dom not in seen_domains
-            seen_domains.add(dom)
-            todo.append((i, l, is_first))
+            todo.append((i, t))
 
         if not os.path.exists(out_path) or not cfg["resume"]:
             open(out_path, "w", encoding="utf-8").close()
@@ -1830,8 +2121,8 @@ class App(tk.Tk):
         q.put(("progress", (ctx["done"], total)))
 
         task_q = queue.Queue()
-        for t in todo:
-            task_q.put(t)
+        for item in todo:
+            task_q.put(item)
 
         n_workers = max(1, min(cfg["workers"], len(todo))) if todo else 0
         with open(out_path, "a", encoding="utf-8") as out:
@@ -1845,7 +2136,7 @@ class App(tk.Tk):
             for t in threads:
                 t.join()
 
-        q.put(("log", "Multi-site scraping finished! Click 'Export Excel (Multi-Sheet)' to view organized tabs."))
+        q.put(("log", "Scraping finished! Click 'Export Excel (Multi-Sheet)' to view organized tabs."))
         q.put(("done", None))
 
 
