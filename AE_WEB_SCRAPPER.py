@@ -2,6 +2,7 @@ import os
 import re
 import json
 import sys
+import shutil
 import socket
 import subprocess
 import time
@@ -290,23 +291,50 @@ def is_port_open(port):
         return s.connect_ex(("127.0.0.1", port)) == 0
 
 
-def parse_chrome_profile_args(custom_profile_path, port):
+def sync_profile_to_isolated_dir(src_profile_path, port):
     """
-    يدعم تمرير مجلد البروفايل مباشرة (مثل C:\\...\\Chrome\\User Data\\Profile 1 أو Default)
-    ويفصل تلقائياً بين --user-data-dir و --profile-directory.
+    ينسخ ملفات الجلسة والكوكيز من بروفايل كروم الشخصي إلى مجلد معزول
+    لتجنب قفل الملفات (File Lock) وقيود أمان منفذ 9222 في كروم.
     """
-    if custom_profile_path and custom_profile_path.strip():
-        p = os.path.normpath(custom_profile_path.strip())
-        base_name = os.path.basename(p)
-        parent_dir = os.path.dirname(p)
-        if base_name == "Default" or base_name.startswith("Profile "):
-            return parent_dir, base_name
-        return p, None
-
     base = os.environ.get("APPDATA") or os.path.join(os.path.expanduser("~"), ".config")
-    default_dir = os.path.join(base, "WebScraperTool", f"RealChromeProfile_{port}")
-    os.makedirs(default_dir, exist_ok=True)
-    return default_dir, None
+    isolated_root = os.path.join(base, "WebScraperTool", f"IsolatedProfile_{port}")
+
+    src = os.path.normpath(src_profile_path.strip())
+    prof_name = os.path.basename(src)
+    if prof_name != "Default" and not prof_name.startswith("Profile "):
+        prof_name = "Default"
+        src = os.path.join(src, "Default") if os.path.isdir(os.path.join(src, "Default")) else src
+
+    dest_prof = os.path.join(isolated_root, prof_name)
+    os.makedirs(dest_prof, exist_ok=True)
+
+    parent_src = os.path.dirname(src)
+    local_state_src = os.path.join(parent_src, "Local State")
+    if os.path.exists(local_state_src):
+        try:
+            shutil.copy2(local_state_src, os.path.join(isolated_root, "Local State"))
+        except Exception:
+            pass
+
+    essential_items = [
+        "Network", "Cookies", "Login Data", "Web Data",
+        "Preferences", "Secure Preferences", "Local Storage",
+        "Session Storage", "IndexedDB", "Extension State"
+    ]
+    for item in essential_items:
+        s_item = os.path.join(src, item)
+        d_item = os.path.join(dest_prof, item)
+        if not os.path.exists(s_item):
+            continue
+        try:
+            if os.path.isdir(s_item):
+                shutil.copytree(s_item, d_item, dirs_exist_ok=True)
+            else:
+                shutil.copy2(s_item, d_item)
+        except Exception:
+            pass
+
+    return isolated_root, prof_name
 
 
 def launch_real_chrome(port=9222, headless=False, chrome_path="", custom_profile=""):
@@ -317,13 +345,21 @@ def launch_real_chrome(port=9222, headless=False, chrome_path="", custom_profile
     if not chrome_exe:
         return False, "Could not find chrome.exe automatically. Please select chrome.exe in Global Options."
 
-    user_data_dir, profile_sub = parse_chrome_profile_args(custom_profile, port)
+    if custom_profile and custom_profile.strip() and os.path.exists(custom_profile.strip()):
+        user_data_dir, profile_sub = sync_profile_to_isolated_dir(custom_profile, port)
+    else:
+        base = os.environ.get("APPDATA") or os.path.join(os.path.expanduser("~"), ".config")
+        user_data_dir = os.path.join(base, "WebScraperTool", f"RealChromeProfile_{port}")
+        os.makedirs(user_data_dir, exist_ok=True)
+        profile_sub = None
+
     cmd = [
         chrome_exe,
         f"--remote-debugging-port={port}",
         f"--user-data-dir={user_data_dir}",
         "--no-first-run",
         "--no-default-browser-check",
+        "--disable-background-networking",
         "--start-maximized",
     ]
     if profile_sub:
@@ -337,12 +373,12 @@ def launch_real_chrome(port=9222, headless=False, chrome_path="", custom_profile
     except Exception as e:
         return False, f"Failed to start Chrome ({chrome_exe}): {e}"
 
-    for _ in range(35):
+    for _ in range(45):
         if is_port_open(port):
-            prof_msg = f" [Profile: {profile_sub}]" if profile_sub else ""
+            prof_msg = f" [Cloned Profile: {profile_sub}]" if profile_sub else ""
             return True, f"Launched Real Chrome{prof_msg} on port {port}"
         time.sleep(0.2)
-    return False, f"Chrome launched but port {port} did not open. (Tip: Close existing Chrome windows using the same profile first)."
+    return False, f"Chrome launched but port {port} did not open. Try clicking 'Kill Chrome' first."
 
 
 def parse_selector(sel):
@@ -357,7 +393,6 @@ def parse_selector(sel):
 
 
 def extract_element_pair(el):
-    """استخراج النص والرابط معاً كـ (text, href) من العنصر."""
     txt = ""
     href = ""
     try:
@@ -458,7 +493,7 @@ def num(var, default):
 
 ALL_SITES = "*"
 ALL_SITES_LABEL = "All sites (default)"
-APP_VERSION = "3.6.0-full-suite"
+APP_VERSION = "3.6.1-profile-clone"
 SITE_OPT_KEYS = (
     "load_wait", "step_timeout", "step_delay", "url_delay",
     "stop_loading", "stealth", "headless", "new_browser",
@@ -652,7 +687,7 @@ class App(tk.Tk):
         self.var_zoom_pct = tk.IntVar(value=100)
 
         # Search Mode Variables
-        self.var_input_mode = tk.StringVar(value="urls")  # "urls" or "search"
+        self.var_input_mode = tk.StringVar(value="urls")
         self.var_search_url = tk.StringVar()
         self.var_search_input_sel = tk.StringVar()
         self.var_search_btn_sel = tk.StringVar()
@@ -777,6 +812,18 @@ class App(tk.Tk):
             except Exception as e:
                 messagebox.showerror("Import Settings", f"Invalid settings file:\n{e}")
 
+    def kill_all_chrome(self):
+        if not messagebox.askyesno("Kill Chrome", "Force close all background chrome.exe processes?"):
+            return
+        try:
+            if sys.platform.startswith("win"):
+                subprocess.run(["taskkill", "/F", "/IM", "chrome.exe"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            else:
+                subprocess.run(["pkill", "-f", "chrome"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            self.log("All background Chrome processes terminated.")
+        except Exception as e:
+            self.log(f"Error killing Chrome: {e}")
+
     def build_ui(self):
         self.apply_theme()
         pad = {"padx": 8, "pady": 3}
@@ -824,17 +871,19 @@ class App(tk.Tk):
         ttk.Entry(r0, textvariable=self.var_folder).pack(side="left", fill="x", expand=True, padx=6)
         ttk.Button(r0, text="Browse...", command=self.pick_folder).pack(side="left")
 
-        # Row 1: Real Chrome + Port + chrome.exe + Profile Folder
+        # Row 1: Real Chrome + Port + Profile Folder + chrome.exe + Kill Chrome
         r1 = ttk.Frame(box)
         r1.grid(row=1, column=0, columnspan=3, sticky="ew", **pad)
         ttk.Checkbutton(r1, text="Use Real Chrome (Port:", variable=self.var_use_real_chrome, command=self.update_summary).pack(side="left")
         ttk.Spinbox(r1, from_=9000, to=9999, width=5, textvariable=self.var_debug_port).pack(side="left", padx=3)
         ttk.Label(r1, text=")  Profile Dir:").pack(side="left")
-        ttk.Entry(r1, textvariable=self.var_chrome_profile, width=26).pack(side="left", fill="x", expand=True, padx=4)
-        ttk.Button(r1, text="Browse Profile...", command=self.pick_chrome_profile).pack(side="left", padx=(0, 8))
+        ttk.Entry(r1, textvariable=self.var_chrome_profile, width=22).pack(side="left", fill="x", expand=True, padx=4)
+        ttk.Button(r1, text="Browse Profile...", command=self.pick_chrome_profile).pack(side="left", padx=(0, 4))
+        ttk.Button(r1, text="Clear", command=lambda: self.var_chrome_profile.set("")).pack(side="left", padx=(0, 8))
         ttk.Label(r1, text="chrome.exe:").pack(side="left")
-        ttk.Entry(r1, textvariable=self.var_chrome_exe, width=18).pack(side="left", padx=4)
-        ttk.Button(r1, text="...", width=3, command=self.pick_chrome_exe).pack(side="left")
+        ttk.Entry(r1, textvariable=self.var_chrome_exe, width=16).pack(side="left", padx=4)
+        ttk.Button(r1, text="...", width=3, command=self.pick_chrome_exe).pack(side="left", padx=(0, 6))
+        ttk.Button(r1, text="Kill Chrome", command=self.kill_all_chrome).pack(side="left")
 
         # Row 2: Timings + Zoom + Workers
         r2 = ttk.Frame(box)
@@ -852,7 +901,7 @@ class App(tk.Tk):
         ttk.Label(r2, text="Workers:").pack(side="left")
         ttk.Spinbox(r2, from_=1, to=4, width=3, textvariable=self.var_workers).pack(side="left", padx=(3, 0))
 
-        # Row 3: Checkboxes + chromedriver
+        # Row 3: Checkboxes
         r3 = ttk.Frame(box)
         r3.grid(row=3, column=0, columnspan=3, sticky="ew", **pad)
         ttk.Checkbutton(r3, text="Close browser when finished", variable=self.var_close_on_finish).pack(side="left", padx=(0, 10))
@@ -1873,7 +1922,6 @@ class App(tk.Tk):
 
         apply_zoom(driver, scfg.get("zoom_pct", 100))
 
-        # إذا كان الوضع Search Mode، نكتب الكلمة المفتاحية في مربع البحث ونضغط Enter أو زر البحث
         if keyword:
             by_s, val_s = parse_selector(scfg["search_input_sel"])
             try:
