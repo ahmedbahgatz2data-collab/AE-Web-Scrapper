@@ -159,7 +159,7 @@ REC_JS = r"""
     try {
       var mode = window.__recMode || 'click';
       var t = (mode === 'click')
-        ? (e.target.closest('a,button,input,select,label,summary,[role=button],[role=tab],[onclick]') || e.target)
+        ? (e.target.closest('select,a,button,input,label,summary,[role=button],[role=tab],[onclick]') || e.target)
         : e.target;
 
       if (mode === 'extract') {
@@ -174,6 +174,7 @@ REC_JS = r"""
       var multiSel = buildMultiSelector(t);
       var multiCount = count(multiSel);
       var sampleText = (t.innerText || t.value || t.getAttribute('aria-label') || '').trim().replace(/\s+/g, ' ').slice(0, 45);
+      var isSelect = (t.tagName && t.tagName.toLowerCase() === 'select');
 
       var data = {
         type: mode,
@@ -181,7 +182,8 @@ REC_JS = r"""
         multi_selector: multiSel,
         multi_count: multiCount,
         sample: sampleText,
-        sample_href: sampleHref
+        sample_href: sampleHref,
+        is_select: isSelect
       };
       console.log('__REC__' + encodeURIComponent(JSON.stringify(data)));
     } catch (err) {}
@@ -189,9 +191,55 @@ REC_JS = r"""
 })();
 """
 
+SET_SELECT_VALUE_JS = r"""
+var el = arguments[0];
+var targetVal = String(arguments[1]);
+
+if (el.tagName && el.tagName.toLowerCase() === 'select') {
+  var found = false;
+  for (var i = 0; i < el.options.length; i++) {
+    if (el.options[i].value === targetVal || el.options[i].text.trim() === targetVal) {
+      el.selectedIndex = i;
+      found = true;
+      break;
+    }
+  }
+  if (!found) {
+    var opt = document.createElement('option');
+    opt.value = targetVal;
+    opt.text = targetVal;
+    el.add(opt);
+    el.value = targetVal;
+  }
+  el.dispatchEvent(new Event('change', { bubbles: true }));
+  el.dispatchEvent(new Event('input', { bubbles: true }));
+
+  // دعم إضافي لمكتبة DataTables لإجبارها على تطبيق العدد الجديد فوراً
+  try {
+    if (window.jQuery && window.jQuery.fn && window.jQuery.fn.dataTable) {
+      var tbl = window.jQuery(el).closest('.dataTables_wrapper').find('table.dataTable');
+      if (tbl.length) {
+        tbl.DataTable().page.len(parseInt(targetVal, 10)).draw();
+      }
+    }
+  } catch (e) {}
+} else {
+  // إذا لم يكن العنصر select تقليدياً (قائمة مخصصة div/ul)، نبحث عن عنصر يحمل النص المطلوب ونضغطه
+  el.click();
+  setTimeout(function () {
+    var items = document.querySelectorAll('li, option, [role="option"], a, button, span, div');
+    for (var j = 0; j < items.length; j++) {
+      if ((items[j].innerText || '').trim() === targetVal) {
+        items[j].click();
+        break;
+      }
+    }
+  }, 300);
+}
+"""
+
 
 def find_system_chrome(custom_path=""):
-    """البحث عن ملف chrome.exe في المسارات القياسية أو سجل الويندوز (Registry)."""
     if custom_path and os.path.exists(custom_path):
         return custom_path
 
@@ -230,7 +278,6 @@ def is_port_open(port):
 
 
 def launch_real_chrome(port=9222, headless=False, chrome_path=""):
-    """تشغيل متصفح Google Chrome الحقيقي بملف تعريف مستقل على منفذ التصحيح."""
     if is_port_open(port):
         return True, f"Connected to already running Chrome on port {port}"
 
@@ -376,7 +423,7 @@ def num(var, default):
 
 ALL_SITES = "*"
 ALL_SITES_LABEL = "All sites (default)"
-APP_VERSION = "3.4.1-real-chrome-fix"
+APP_VERSION = "3.5.0-custom-page-size"
 SITE_OPT_KEYS = (
     "load_wait", "step_timeout", "step_delay", "url_delay",
     "stop_loading", "stealth", "headless", "new_browser", "use_real_chrome"
@@ -571,7 +618,7 @@ class App(tk.Tk):
         self.var_stealth = tk.BooleanVar(value=False)
         self.var_url_delay = tk.DoubleVar(value=0)
         self.var_step_timeout = tk.DoubleVar(value=10)
-        self.var_step_delay = tk.DoubleVar(value=1)
+        self.var_step_delay = tk.DoubleVar(value=1.5)
         self.var_continue = tk.BooleanVar(value=True)
         self.var_retries = tk.IntVar(value=2)
         self.var_workers = tk.IntVar(value=1)
@@ -792,7 +839,7 @@ class App(tk.Tk):
 
         # 2. Sequential Workflow
         seq_box = ttk.LabelFrame(mid, text="2. Site Workflow (Drag & Drop rows to reorder)")
-        mid.add(seq_box, stretch="always", minsize=540)
+        mid.add(seq_box, stretch="always", minsize=560)
         self.lst_seq = tk.Listbox(seq_box, height=8, activestyle="none", exportselection=False, **LIST_OPTS)
         self.lst_seq.pack(fill="both", expand=True, padx=6, pady=(6, 4))
 
@@ -806,12 +853,13 @@ class App(tk.Tk):
         self.btn_rec_click.pack(side="left")
         self.btn_rec_extract = ttk.Button(sr1, text="\u25CF Pick Extract Element", style="Accent.TButton", command=lambda: self.toggle_record("extract"))
         self.btn_rec_extract.pack(side="left", padx=4)
-        ttk.Button(sr1, text="+ Manual Field", command=self.add_manual_extract).pack(side="left", padx=4)
+        ttk.Button(sr1, text="+ Set Page Size / Select", command=self.add_select_value_step).pack(side="left", padx=3)
+        ttk.Button(sr1, text="+ Manual Field", command=self.add_manual_extract).pack(side="left", padx=3)
         ttk.Button(sr1, text="+ Wait", command=self.add_wait).pack(side="left")
 
         sr2 = ttk.Frame(seq_box)
         sr2.pack(fill="x", padx=6, pady=(2, 6))
-        ttk.Button(sr2, text="Rename", command=self.rename_seq).pack(side="left")
+        ttk.Button(sr2, text="Rename / Edit Val", command=self.rename_or_edit_seq).pack(side="left")
         ttk.Button(sr2, text="Text / Link (href)", command=self.toggle_extract_attr).pack(side="left", padx=3)
         ttk.Button(sr2, text="Single / Multi List", command=self.toggle_multi_mode).pack(side="left", padx=3)
         ttk.Button(sr2, text="All Links / 1st Link Only", command=self.toggle_first_link_only).pack(side="left", padx=3)
@@ -1074,7 +1122,7 @@ class App(tk.Tk):
         v_real = tk.BooleanVar(value=cur.get("use_real_chrome", self.var_use_real_chrome.get()))
         v_load = tk.IntVar(value=cur.get("load_wait", num(self.var_load_wait, 5)))
         v_tout = tk.DoubleVar(value=cur.get("step_timeout", num(self.var_step_timeout, 10)))
-        v_sdel = tk.DoubleVar(value=cur.get("step_delay", num(self.var_step_delay, 1)))
+        v_sdel = tk.DoubleVar(value=cur.get("step_delay", num(self.var_step_delay, 1.5)))
         v_udel = tk.DoubleVar(value=cur.get("url_delay", num(self.var_url_delay, 0)))
         v_head = tk.BooleanVar(value=cur.get("headless", self.var_headless.get()))
         v_stel = tk.BooleanVar(value=cur.get("stealth", self.var_stealth.get()))
@@ -1136,6 +1184,8 @@ class App(tk.Tk):
                 txt = f"{n}.{scope_tag} [WAIT] {item['seconds']:g} s"
             elif t == "click":
                 txt = f"{n}.{scope_tag} [CLICK] -> {item['selector']}"
+            elif t == "select_value":
+                txt = f"{n}.{scope_tag} [SET SELECT = '{item['value']}'] -> {item['selector']}"
             elif t == "extract":
                 mode_tag = "MULTI-LIST" if item.get("multi") else "SINGLE"
                 attr_map = {"text": "TEXT", "href": "LINK (href)", "both": "TEXT + LINK"}
@@ -1145,6 +1195,31 @@ class App(tk.Tk):
         if select is not None and 0 <= select < len(self.sequence):
             self.lst_seq.selection_set(select)
         self.update_summary()
+
+    def add_select_value_step(self):
+        sel = simpledialog.askstring(
+            "Dropdown / Page Size Selector",
+            "Enter CSS or xpath= selector for the dropdown\n(e.g. select[name*='length'] or .dataTables_length select):",
+            initialvalue="select[name*='length']",
+            parent=self,
+        )
+        if not sel or not sel.strip():
+            return
+        val = simpledialog.askstring(
+            "Target Value",
+            "Enter value to select or inject (e.g. 100, 1000, 2000):",
+            initialvalue="2000",
+            parent=self,
+        )
+        if not val or not val.strip():
+            return
+        self.sequence.append({
+            "type": "select_value",
+            "selector": sel.strip(),
+            "value": val.strip(),
+            "first_link_only": False,
+        })
+        self.refresh_sequence(select=len(self.sequence) - 1)
 
     def toggle_first_link_only(self):
         sel = self.lst_seq.curselection()
@@ -1230,7 +1305,7 @@ class App(tk.Tk):
             self.sequence.append({"type": "wait", "seconds": sec, "first_link_only": False})
             self.refresh_sequence(select=len(self.sequence) - 1)
 
-    def rename_seq(self):
+    def rename_or_edit_seq(self):
         sel = self.lst_seq.curselection()
         if not sel:
             return
@@ -1240,6 +1315,11 @@ class App(tk.Tk):
             new_name = simpledialog.askstring("Rename Field", "New column name:", initialvalue=item["name"], parent=self)
             if new_name and new_name.strip():
                 item["name"] = new_name.strip()
+                self.refresh_sequence(select=idx)
+        elif item["type"] == "select_value":
+            new_val = simpledialog.askstring("Edit Select Value", "New target value (e.g. 100, 1000, 2000):", initialvalue=item["value"], parent=self)
+            if new_val and new_val.strip():
+                item["value"] = new_val.strip()
                 self.refresh_sequence(select=idx)
 
     # ----- Visual Picker -----
@@ -1363,6 +1443,24 @@ class App(tk.Tk):
                 elif kind == "rec_event":
                     m = data.get("type")
                     if m == "click":
+                        if data.get("is_select"):
+                            val = simpledialog.askstring(
+                                "Dropdown Detected (<select>)",
+                                f"You clicked a dropdown: {data['selector']}\n\n"
+                                f"Enter the value you want to select or inject (e.g. 100, 1000, 2000):",
+                                initialvalue="2000",
+                                parent=self,
+                            )
+                            if val and val.strip():
+                                self.sequence.append({
+                                    "type": "select_value",
+                                    "selector": data["selector"],
+                                    "value": val.strip(),
+                                    "first_link_only": False,
+                                })
+                                self.refresh_sequence(select=len(self.sequence) - 1)
+                                continue
+
                         first_only = messagebox.askyesno(
                             "Click Scope",
                             f"Recorded Click: {data['selector']}\n\nRun this click on the FIRST link of this domain only (e.g. Cookie banner)?\n(Click 'No' to run on ALL links)"
@@ -1449,7 +1547,7 @@ class App(tk.Tk):
             "load_wait": num(self.var_load_wait, 5),
             "stop_loading": self.var_stop_loading.get(),
             "step_timeout": num(self.var_step_timeout, 10),
-            "step_delay": num(self.var_step_delay, 1),
+            "step_delay": num(self.var_step_delay, 1.5),
             "continue_missing": self.var_continue.get(),
             "sequence_sets": json.loads(json.dumps(self.sequence_sets)),
             "site_settings": json.loads(json.dumps(self.site_settings)),
@@ -1584,6 +1682,20 @@ class App(tk.Tk):
                         click_element(driver, el)
                     except Exception:
                         pass
+                time.sleep(scfg["step_delay"])
+            elif t == "select_value":
+                by, val = parse_selector(item["selector"])
+                try:
+                    els = WebDriverWait(driver, scfg["step_timeout"]).until(lambda d: d.find_elements(by, val) or False)
+                except TimeoutException:
+                    els = []
+                if not els:
+                    if scfg["continue_missing"]:
+                        continue
+                    raise RuntimeError(f"Dropdown not found: {item['selector']}")
+                target_el = ([e for e in els if is_displayed(e)] or els)[0]
+                driver.execute_script("arguments[0].scrollIntoView({block:'center'});", target_el)
+                driver.execute_script(SET_SELECT_VALUE_JS, target_el, item["value"])
                 time.sleep(scfg["step_delay"])
             elif t == "extract":
                 by, val = parse_selector(item["selector"])
