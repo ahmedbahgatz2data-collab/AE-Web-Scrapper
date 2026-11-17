@@ -190,8 +190,11 @@ REC_JS = r"""
 """
 
 
-def find_system_chrome():
-    """البحث تلقائياً عن ملف تشغيل متصفح Google Chrome الحقيقي على الجهاز."""
+def find_system_chrome(custom_path=""):
+    """البحث عن ملف chrome.exe في المسارات القياسية أو سجل الويندوز (Registry)."""
+    if custom_path and os.path.exists(custom_path):
+        return custom_path
+
     candidates = [
         os.path.join(os.environ.get("PROGRAMFILES", ""), "Google", "Chrome", "Application", "chrome.exe"),
         os.path.join(os.environ.get("PROGRAMFILES(X86)", ""), "Google", "Chrome", "Application", "chrome.exe"),
@@ -203,7 +206,21 @@ def find_system_chrome():
     for p in candidates:
         if p and os.path.exists(p):
             return p
-    return "chrome"
+
+    if sys.platform.startswith("win"):
+        try:
+            import winreg
+            for root in (winreg.HKEY_LOCAL_MACHINE, winreg.HKEY_CURRENT_USER):
+                try:
+                    with winreg.OpenKey(root, r"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\chrome.exe") as k:
+                        val, _ = winreg.QueryValueEx(k, None)
+                        if val and os.path.exists(val):
+                            return val
+                except OSError:
+                    pass
+        except Exception:
+            pass
+    return None
 
 
 def is_port_open(port):
@@ -212,11 +229,15 @@ def is_port_open(port):
         return s.connect_ex(("127.0.0.1", port)) == 0
 
 
-def launch_real_chrome(port=9222, headless=False):
+def launch_real_chrome(port=9222, headless=False, chrome_path=""):
     """تشغيل متصفح Google Chrome الحقيقي بملف تعريف مستقل على منفذ التصحيح."""
     if is_port_open(port):
-        return
-    chrome_exe = find_system_chrome()
+        return True, f"Connected to already running Chrome on port {port}"
+
+    chrome_exe = find_system_chrome(chrome_path)
+    if not chrome_exe:
+        return False, "Could not find chrome.exe automatically. Please select chrome.exe in Global Options."
+
     base = os.environ.get("APPDATA") or os.path.join(os.path.expanduser("~"), ".config")
     profile_dir = os.path.join(base, "WebScraperTool", f"RealChromeProfile_{port}")
     os.makedirs(profile_dir, exist_ok=True)
@@ -233,11 +254,16 @@ def launch_real_chrome(port=9222, headless=False):
         cmd.append("--headless=new")
         cmd.append("--window-size=1920,1080")
 
-    subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    for _ in range(25):
+    try:
+        subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception as e:
+        return False, f"Failed to start Chrome ({chrome_exe}): {e}"
+
+    for _ in range(35):
         if is_port_open(port):
-            break
+            return True, f"Launched Real Chrome ({chrome_exe}) on port {port}"
         time.sleep(0.2)
+    return False, f"Chrome launched ({chrome_exe}) but port {port} did not open in time."
 
 
 def parse_selector(sel):
@@ -350,7 +376,7 @@ def num(var, default):
 
 ALL_SITES = "*"
 ALL_SITES_LABEL = "All sites (default)"
-APP_VERSION = "3.4.0-real-chrome"
+APP_VERSION = "3.4.1-real-chrome-fix"
 SITE_OPT_KEYS = (
     "load_wait", "step_timeout", "step_delay", "url_delay",
     "stop_loading", "stealth", "headless", "new_browser", "use_real_chrome"
@@ -534,13 +560,14 @@ class App(tk.Tk):
 
         self.var_folder = tk.StringVar()
         self.var_driver = tk.StringVar()
-        self.var_use_real_chrome = tk.BooleanVar(value=False)
+        self.var_chrome_exe = tk.StringVar()
+        self.var_use_real_chrome = tk.BooleanVar(value=True)
         self.var_debug_port = tk.IntVar(value=9222)
         self.var_load_wait = tk.IntVar(value=5)
         self.var_stop_loading = tk.BooleanVar(value=True)
         self.var_dedupe = tk.BooleanVar(value=True)
         self.var_browser_mode = tk.StringVar(value="single")
-        self.var_headless = tk.BooleanVar(value=True)
+        self.var_headless = tk.BooleanVar(value=False)
         self.var_stealth = tk.BooleanVar(value=False)
         self.var_url_delay = tk.DoubleVar(value=0)
         self.var_step_timeout = tk.DoubleVar(value=10)
@@ -551,7 +578,7 @@ class App(tk.Tk):
         self.var_resume = tk.BooleanVar(value=True)
 
         self.persist = {
-            "folder": self.var_folder, "driver": self.var_driver,
+            "folder": self.var_folder, "driver": self.var_driver, "chrome_exe": self.var_chrome_exe,
             "use_real_chrome": self.var_use_real_chrome, "debug_port": self.var_debug_port,
             "load_wait": self.var_load_wait, "stop_loading": self.var_stop_loading,
             "dedupe": self.var_dedupe, "browser_mode": self.var_browser_mode,
@@ -690,10 +717,13 @@ class App(tk.Tk):
 
         drv_row = ttk.Frame(box)
         drv_row.grid(row=1, column=0, columnspan=3, sticky="ew", **pad)
-        ttk.Checkbutton(drv_row, text="Use Real Chrome Browser Directly (Attach Port:", variable=self.var_use_real_chrome, command=self.update_summary).pack(side="left")
+        ttk.Checkbutton(drv_row, text="Use Real Chrome (Port:", variable=self.var_use_real_chrome, command=self.update_summary).pack(side="left")
         ttk.Spinbox(drv_row, from_=9000, to=9999, width=6, textvariable=self.var_debug_port).pack(side="left", padx=4)
-        ttk.Label(drv_row, text=")   |   Or custom chromedriver:").pack(side="left")
-        ttk.Entry(drv_row, textvariable=self.var_driver, width=32).pack(side="left", fill="x", expand=True, padx=6)
+        ttk.Label(drv_row, text=") chrome.exe:").pack(side="left")
+        ttk.Entry(drv_row, textvariable=self.var_chrome_exe, width=24).pack(side="left", fill="x", expand=True, padx=4)
+        ttk.Button(drv_row, text="Browse Chrome...", command=self.pick_chrome_exe).pack(side="left", padx=(0, 8))
+        ttk.Label(drv_row, text="chromedriver:").pack(side="left")
+        ttk.Entry(drv_row, textvariable=self.var_driver, width=20).pack(side="left", fill="x", expand=True, padx=4)
         ttk.Button(drv_row, text="Browse...", command=self.pick_driver).pack(side="left")
 
         opts = ttk.Frame(box)
@@ -799,7 +829,7 @@ class App(tk.Tk):
         self.refresh_sets()
         self.refresh_sequence()
         self.update_summary()
-        self.set_options(False)
+        self.set_options(True)
 
     # ----- Drag & Drop Handlers -----
     def on_drag_start(self, event):
@@ -903,6 +933,11 @@ class App(tk.Tk):
         d = filedialog.askdirectory(title="Choose save folder")
         if d:
             self.var_folder.set(d)
+
+    def pick_chrome_exe(self):
+        f = filedialog.askopenfilename(title="Choose chrome.exe", filetypes=[("Chrome Executable", "chrome.exe"), ("All files", "*.*")])
+        if f:
+            self.var_chrome_exe.set(f)
 
     def pick_driver(self):
         f = filedialog.askopenfilename(title="Choose chromedriver", filetypes=[("chromedriver", "*.exe"), ("All files", "*.*")])
@@ -1238,7 +1273,14 @@ class App(tk.Tk):
             self.btn_rec_extract.config(text="\u25A0 Stop Picking")
             self.btn_rec_click.config(state="disabled")
 
-        threading.Thread(target=self.record_worker, args=(url, mode, self.var_driver.get().strip(), self.var_stealth.get()), daemon=True).start()
+        rec_cfg = {
+            "driver": self.var_driver.get().strip(),
+            "chrome_exe": self.var_chrome_exe.get().strip(),
+            "use_real_chrome": self.var_use_real_chrome.get(),
+            "debug_port": num(self.var_debug_port, 9222),
+            "stealth": self.var_stealth.get(),
+        }
+        threading.Thread(target=self.record_worker, args=(url, mode, rec_cfg), daemon=True).start()
 
     def drain_logs(self, driver):
         for entry in driver.get_log("browser"):
@@ -1250,22 +1292,34 @@ class App(tk.Tk):
                 except Exception:
                     pass
 
-    def record_worker(self, url, mode, driver_path, stealth):
+    def record_worker(self, url, mode, rec_cfg):
         driver = None
+        is_real = bool(rec_cfg.get("use_real_chrome"))
         try:
             options = webdriver.ChromeOptions()
-            options.add_argument("--start-maximized")
             options.set_capability("goog:loggingPrefs", {"browser": "ALL"})
-            if stealth:
-                apply_stealth_options(options)
-            driver = webdriver.Chrome(service=make_service(driver_path), options=options)
-            self.rec_driver = driver
-            if stealth:
-                apply_stealth_driver(driver)
 
+            if is_real:
+                port = int(rec_cfg.get("debug_port", 9222))
+                ok, msg = launch_real_chrome(port=port, headless=False, chrome_path=rec_cfg.get("chrome_exe", ""))
+                self.msg_queue.put(("log", msg))
+                if not ok:
+                    return
+                options.add_experimental_option("debuggerAddress", f"127.0.0.1:{port}")
+                driver = webdriver.Chrome(service=make_service(rec_cfg["driver"]), options=options)
+            else:
+                options.add_argument("--start-maximized")
+                if rec_cfg.get("stealth"):
+                    apply_stealth_options(options)
+                driver = webdriver.Chrome(service=make_service(rec_cfg["driver"]), options=options)
+                if rec_cfg.get("stealth"):
+                    apply_stealth_driver(driver)
+
+            self.rec_driver = driver
             init_script = f"window.__recMode = '{mode}';\n" + REC_JS
             driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {"source": init_script})
             driver.get(url)
+            driver.execute_script(init_script)
 
             while not self.rec_stop.is_set():
                 try:
@@ -1276,7 +1330,7 @@ class App(tk.Tk):
         except Exception as e:
             self.msg_queue.put(("log", f"Browser error: {e}"))
         finally:
-            if driver:
+            if driver and not is_real:
                 try:
                     driver.quit()
                 except Exception:
@@ -1389,6 +1443,7 @@ class App(tk.Tk):
         return links, {
             "folder": os.path.abspath(folder),
             "driver": self.var_driver.get().strip(),
+            "chrome_exe": self.var_chrome_exe.get().strip(),
             "use_real_chrome": self.var_use_real_chrome.get(),
             "debug_port": num(self.var_debug_port, 9222),
             "load_wait": num(self.var_load_wait, 5),
@@ -1460,10 +1515,16 @@ class App(tk.Tk):
         options = webdriver.ChromeOptions()
         options.page_load_strategy = "none"
 
-        # خيار استخدام متصفح Google Chrome الحقيقي مباشرة بدلاً من جلسة ChromeDriver التقليدية
         if scfg.get("use_real_chrome"):
             port = int(scfg.get("debug_port", 9222)) + worker_idx
-            launch_real_chrome(port=port, headless=scfg.get("headless", False))
+            ok, msg = launch_real_chrome(
+                port=port,
+                headless=scfg.get("headless", False),
+                chrome_path=scfg.get("chrome_exe", ""),
+            )
+            self.msg_queue.put(("log", f"   {msg}"))
+            if not ok:
+                raise RuntimeError(msg)
             options.add_experimental_option("debuggerAddress", f"127.0.0.1:{port}")
             driver = webdriver.Chrome(service=make_service(scfg["driver"]), options=options)
             self.live_drivers.add(driver)
@@ -1587,6 +1648,7 @@ class App(tk.Tk):
                         break
                     except Exception as e:
                         note = str(e).splitlines()[0] if str(e) else type(e).__name__
+                        self.msg_queue.put(("log", f"   Attempt {attempt} error: {note}"))
                         if holder["d"]:
                             self.close_driver(holder["d"], is_real_chrome=holder["real"])
                             holder["d"] = None
