@@ -2,6 +2,7 @@ import os
 import re
 import json
 import sys
+import socket
 import subprocess
 import time
 import queue
@@ -96,9 +97,7 @@ REC_JS = r"""
     return parts.join(' > ');
   }
 
-  // بناء Selector عام يطابق العمود الرأسي بالكامل في الجداول والقوائم
   function buildMultiSelector(el) {
-    // 1. إذا كان العنصر داخل خلية جدول (td أو th)، نعمم الصف (tr) ونثبت رقم العمود (td:nth-of-type)
     var td = el.closest('td, th');
     if (td) {
       var tr = td.parentElement;
@@ -113,7 +112,6 @@ REC_JS = r"""
       }
     }
 
-    // 2. للقوائم غير الجدولية (مثل البطاقات أو عناصر li)
     var parts = [];
     var cur = el;
     var generalized = false;
@@ -192,6 +190,56 @@ REC_JS = r"""
 """
 
 
+def find_system_chrome():
+    """البحث تلقائياً عن ملف تشغيل متصفح Google Chrome الحقيقي على الجهاز."""
+    candidates = [
+        os.path.join(os.environ.get("PROGRAMFILES", ""), "Google", "Chrome", "Application", "chrome.exe"),
+        os.path.join(os.environ.get("PROGRAMFILES(X86)", ""), "Google", "Chrome", "Application", "chrome.exe"),
+        os.path.join(os.environ.get("LOCALAPPDATA", ""), "Google", "Chrome", "Application", "chrome.exe"),
+        "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+        "/usr/bin/google-chrome",
+        "/usr/bin/chromium-browser",
+    ]
+    for p in candidates:
+        if p and os.path.exists(p):
+            return p
+    return "chrome"
+
+
+def is_port_open(port):
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.settimeout(0.4)
+        return s.connect_ex(("127.0.0.1", port)) == 0
+
+
+def launch_real_chrome(port=9222, headless=False):
+    """تشغيل متصفح Google Chrome الحقيقي بملف تعريف مستقل على منفذ التصحيح."""
+    if is_port_open(port):
+        return
+    chrome_exe = find_system_chrome()
+    base = os.environ.get("APPDATA") or os.path.join(os.path.expanduser("~"), ".config")
+    profile_dir = os.path.join(base, "WebScraperTool", f"RealChromeProfile_{port}")
+    os.makedirs(profile_dir, exist_ok=True)
+
+    cmd = [
+        chrome_exe,
+        f"--remote-debugging-port={port}",
+        f"--user-data-dir={profile_dir}",
+        "--no-first-run",
+        "--no-default-browser-check",
+        "--start-maximized",
+    ]
+    if headless:
+        cmd.append("--headless=new")
+        cmd.append("--window-size=1920,1080")
+
+    subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    for _ in range(25):
+        if is_port_open(port):
+            break
+        time.sleep(0.2)
+
+
 def parse_selector(sel):
     sel = sel.strip()
     low = sel.lower()
@@ -204,7 +252,6 @@ def parse_selector(sel):
 
 
 def extract_element_value(el, attr_mode):
-    """استخراج النص أو الرابط (href) أو كليهما من العنصر."""
     txt = ""
     href = ""
     try:
@@ -303,8 +350,11 @@ def num(var, default):
 
 ALL_SITES = "*"
 ALL_SITES_LABEL = "All sites (default)"
-APP_VERSION = "3.3.0-table-col-fix"
-SITE_OPT_KEYS = ("load_wait", "step_timeout", "step_delay", "url_delay", "stop_loading", "stealth", "headless", "new_browser")
+APP_VERSION = "3.4.0-real-chrome"
+SITE_OPT_KEYS = (
+    "load_wait", "step_timeout", "step_delay", "url_delay",
+    "stop_loading", "stealth", "headless", "new_browser", "use_real_chrome"
+)
 
 
 def settings_file():
@@ -484,6 +534,8 @@ class App(tk.Tk):
 
         self.var_folder = tk.StringVar()
         self.var_driver = tk.StringVar()
+        self.var_use_real_chrome = tk.BooleanVar(value=False)
+        self.var_debug_port = tk.IntVar(value=9222)
         self.var_load_wait = tk.IntVar(value=5)
         self.var_stop_loading = tk.BooleanVar(value=True)
         self.var_dedupe = tk.BooleanVar(value=True)
@@ -500,6 +552,7 @@ class App(tk.Tk):
 
         self.persist = {
             "folder": self.var_folder, "driver": self.var_driver,
+            "use_real_chrome": self.var_use_real_chrome, "debug_port": self.var_debug_port,
             "load_wait": self.var_load_wait, "stop_loading": self.var_stop_loading,
             "dedupe": self.var_dedupe, "browser_mode": self.var_browser_mode,
             "headless": self.var_headless, "stealth": self.var_stealth,
@@ -635,9 +688,13 @@ class App(tk.Tk):
         ttk.Entry(box, textvariable=self.var_folder).grid(row=0, column=1, sticky="ew", **pad)
         ttk.Button(box, text="Browse...", command=self.pick_folder).grid(row=0, column=2, **pad)
 
-        ttk.Label(box, text="chromedriver (optional):").grid(row=1, column=0, sticky="w", **pad)
-        ttk.Entry(box, textvariable=self.var_driver).grid(row=1, column=1, sticky="ew", **pad)
-        ttk.Button(box, text="Browse...", command=self.pick_driver).grid(row=1, column=2, **pad)
+        drv_row = ttk.Frame(box)
+        drv_row.grid(row=1, column=0, columnspan=3, sticky="ew", **pad)
+        ttk.Checkbutton(drv_row, text="Use Real Chrome Browser Directly (Attach Port:", variable=self.var_use_real_chrome, command=self.update_summary).pack(side="left")
+        ttk.Spinbox(drv_row, from_=9000, to=9999, width=6, textvariable=self.var_debug_port).pack(side="left", padx=4)
+        ttk.Label(drv_row, text=")   |   Or custom chromedriver:").pack(side="left")
+        ttk.Entry(drv_row, textvariable=self.var_driver, width=32).pack(side="left", fill="x", expand=True, padx=6)
+        ttk.Button(drv_row, text="Browse...", command=self.pick_driver).pack(side="left")
 
         opts = ttk.Frame(box)
         opts.grid(row=2, column=0, columnspan=3, sticky="w", **pad)
@@ -703,7 +760,7 @@ class App(tk.Tk):
         self.lbl_count.pack(side="right")
         self.txt_links.bind("<<Modified>>", self.on_links_modified)
 
-        # 2. Sequential Workflow (Drag & Drop Reordering + Text/Link Extraction + First-Link Scope)
+        # 2. Sequential Workflow
         seq_box = ttk.LabelFrame(mid, text="2. Site Workflow (Drag & Drop rows to reorder)")
         mid.add(seq_box, stretch="always", minsize=540)
         self.lst_seq = tk.Listbox(seq_box, height=8, activestyle="none", exportselection=False, **LIST_OPTS)
@@ -744,7 +801,7 @@ class App(tk.Tk):
         self.update_summary()
         self.set_options(False)
 
-    # ----- Drag & Drop Handlers for Step Reordering -----
+    # ----- Drag & Drop Handlers -----
     def on_drag_start(self, event):
         idx = self.lst_seq.nearest(event.y)
         if 0 <= idx < len(self.sequence):
@@ -804,8 +861,9 @@ class App(tk.Tk):
     def update_summary(self):
         extract_count = sum(1 for item in self.sequence if item["type"] == "extract")
         sites_count = len([k for k in self.sequence_sets if k != ALL_SITES])
+        engine_txt = f"Real Chrome (:{num(self.var_debug_port, 9222)})" if self.var_use_real_chrome.get() else "Auto ChromeDriver"
         self.lbl_summary.config(
-            text=f"Sites: {sites_count}   \u00B7   Steps: {len(self.sequence)} ({extract_count} fields)   \u00B7   Workers: {num(self.var_workers, 1)}   \u00B7   Auto-Saved Locally"
+            text=f"Engine: {engine_txt}   \u00B7   Sites: {sites_count}   \u00B7   Steps: {len(self.sequence)} ({extract_count} fields)   \u00B7   Workers: {num(self.var_workers, 1)}"
         )
         if self.current_set == ALL_SITES:
             self.lbl_site_info.config(text="Using Global Options")
@@ -978,6 +1036,7 @@ class App(tk.Tk):
         dlg.resizable(False, False)
 
         v_use = tk.BooleanVar(value=host in self.site_settings)
+        v_real = tk.BooleanVar(value=cur.get("use_real_chrome", self.var_use_real_chrome.get()))
         v_load = tk.IntVar(value=cur.get("load_wait", num(self.var_load_wait, 5)))
         v_tout = tk.DoubleVar(value=cur.get("step_timeout", num(self.var_step_timeout, 10)))
         v_sdel = tk.DoubleVar(value=cur.get("step_delay", num(self.var_step_delay, 1)))
@@ -1002,16 +1061,18 @@ class App(tk.Tk):
         ttk.Label(dlg, text="Delay between URLs (s):").grid(row=4, column=0, sticky="w", **pad)
         ttk.Spinbox(dlg, from_=0, to=300, increment=0.5, width=8, textvariable=v_udel).grid(row=4, column=1, sticky="w", **pad)
 
-        ttk.Checkbutton(dlg, text="Hidden Browser (Headless)", variable=v_head).grid(row=5, column=0, columnspan=2, sticky="w", **pad)
-        ttk.Checkbutton(dlg, text="Stealth Mode (Anti-Bot)", variable=v_stel).grid(row=6, column=0, columnspan=2, sticky="w", **pad)
-        ttk.Checkbutton(dlg, text="Stop loading early", variable=v_stop).grid(row=7, column=0, columnspan=2, sticky="w", **pad)
-        ttk.Checkbutton(dlg, text="Reopen fresh browser for every URL", variable=v_newb).grid(row=8, column=0, columnspan=2, sticky="w", **pad)
+        ttk.Checkbutton(dlg, text="Use Real Chrome Browser Directly", variable=v_real).grid(row=5, column=0, columnspan=2, sticky="w", **pad)
+        ttk.Checkbutton(dlg, text="Hidden Browser (Headless)", variable=v_head).grid(row=6, column=0, columnspan=2, sticky="w", **pad)
+        ttk.Checkbutton(dlg, text="Stealth Mode (Anti-Bot)", variable=v_stel).grid(row=7, column=0, columnspan=2, sticky="w", **pad)
+        ttk.Checkbutton(dlg, text="Stop loading early", variable=v_stop).grid(row=8, column=0, columnspan=2, sticky="w", **pad)
+        ttk.Checkbutton(dlg, text="Reopen fresh browser for every URL", variable=v_newb).grid(row=9, column=0, columnspan=2, sticky="w", **pad)
 
         def save_site_opts():
             if not v_use.get():
                 self.site_settings.pop(host, None)
             else:
                 self.site_settings[host] = {
+                    "use_real_chrome": bool(v_real.get()),
                     "load_wait": int(v_load.get()),
                     "step_timeout": float(v_tout.get()),
                     "step_delay": float(v_sdel.get()),
@@ -1025,7 +1086,7 @@ class App(tk.Tk):
             self.update_summary()
 
         btns = ttk.Frame(dlg)
-        btns.grid(row=9, column=0, columnspan=2, sticky="e", padx=12, pady=10)
+        btns.grid(row=10, column=0, columnspan=2, sticky="e", padx=12, pady=10)
         ttk.Button(btns, text="Save", style="Accent.TButton", command=save_site_opts).pack(side="left")
         ttk.Button(btns, text="Cancel", command=dlg.destroy).pack(side="left", padx=6)
         dlg.grab_set()
@@ -1328,6 +1389,8 @@ class App(tk.Tk):
         return links, {
             "folder": os.path.abspath(folder),
             "driver": self.var_driver.get().strip(),
+            "use_real_chrome": self.var_use_real_chrome.get(),
+            "debug_port": num(self.var_debug_port, 9222),
             "load_wait": num(self.var_load_wait, 5),
             "stop_loading": self.var_stop_loading.get(),
             "step_timeout": num(self.var_step_timeout, 10),
@@ -1379,7 +1442,7 @@ class App(tk.Tk):
         q.put(("log", f"TEST [{site_key}] (First Link) on: {link}"))
         driver = None
         try:
-            driver = self.new_driver(scfg)
+            driver = self.new_driver(scfg, worker_idx=0)
             page_title, rows_data, status, note = self.execute_sequence(driver, link, scfg, seq, is_first_in_domain=True)
             q.put(("log", f"   Page Title: {page_title} | Extracted Rows: {len(rows_data)}"))
             for r_idx, fdict in enumerate(rows_data[:10], 1):
@@ -1387,15 +1450,25 @@ class App(tk.Tk):
         except Exception as e:
             q.put(("log", f"   Error: {e}"))
         finally:
-            self.close_driver(driver)
+            self.close_driver(driver, is_real_chrome=scfg.get("use_real_chrome"))
 
     def stop(self):
         self.stop_event.set()
         self.msg_queue.put(("log", "Stopping..."))
 
-    def new_driver(self, scfg):
+    def new_driver(self, scfg, worker_idx=0):
         options = webdriver.ChromeOptions()
         options.page_load_strategy = "none"
+
+        # خيار استخدام متصفح Google Chrome الحقيقي مباشرة بدلاً من جلسة ChromeDriver التقليدية
+        if scfg.get("use_real_chrome"):
+            port = int(scfg.get("debug_port", 9222)) + worker_idx
+            launch_real_chrome(port=port, headless=scfg.get("headless", False))
+            options.add_experimental_option("debuggerAddress", f"127.0.0.1:{port}")
+            driver = webdriver.Chrome(service=make_service(scfg["driver"]), options=options)
+            self.live_drivers.add(driver)
+            return driver
+
         options.add_argument("--start-maximized")
         if scfg.get("headless"):
             options.add_argument("--headless=new")
@@ -1408,11 +1481,12 @@ class App(tk.Tk):
         self.live_drivers.add(driver)
         return driver
 
-    def close_driver(self, driver):
+    def close_driver(self, driver, is_real_chrome=False):
         if driver:
             self.live_drivers.discard(driver)
             try:
-                driver.quit()
+                if not is_real_chrome:
+                    driver.quit()
             except Exception:
                 pass
 
@@ -1477,8 +1551,8 @@ class App(tk.Tk):
 
         return page_title, rows_output, "OK", ""
 
-    def worker_loop(self, task_q, cfg, ctx):
-        holder = {"d": None, "sig": None}
+    def worker_loop(self, task_q, cfg, ctx, worker_idx=0):
+        holder = {"d": None, "sig": None, "real": False}
         try:
             while not self.stop_event.is_set():
                 try:
@@ -1489,10 +1563,10 @@ class App(tk.Tk):
                 site_key = resolve_site_key(cfg["sequence_sets"], link)
                 scfg = apply_site_cfg(cfg, link)
                 seq = cfg["sequence_sets"].get(site_key, [])
-                driver_sig = (scfg.get("headless"), scfg.get("stealth"))
+                driver_sig = (scfg.get("headless"), scfg.get("stealth"), scfg.get("use_real_chrome"))
 
                 if holder["d"] is not None and holder["sig"] != driver_sig:
-                    self.close_driver(holder["d"])
+                    self.close_driver(holder["d"], is_real_chrome=holder["real"])
                     holder["d"] = None
 
                 tag_1st = " [1st in Domain]" if is_first_domain else ""
@@ -1504,8 +1578,9 @@ class App(tk.Tk):
                         break
                     try:
                         if holder["d"] is None:
-                            holder["d"] = self.new_driver(scfg)
+                            holder["d"] = self.new_driver(scfg, worker_idx=worker_idx)
                             holder["sig"] = driver_sig
+                            holder["real"] = bool(scfg.get("use_real_chrome"))
                         page_title, rows_data, status, note = self.execute_sequence(
                             holder["d"], link, scfg, seq, is_first_in_domain=is_first_domain
                         )
@@ -1513,13 +1588,13 @@ class App(tk.Tk):
                     except Exception as e:
                         note = str(e).splitlines()[0] if str(e) else type(e).__name__
                         if holder["d"]:
-                            self.close_driver(holder["d"])
+                            self.close_driver(holder["d"], is_real_chrome=holder["real"])
                             holder["d"] = None
                     if attempt <= cfg["retries"] and not self.stop_event.is_set():
                         time.sleep(2)
 
                 if scfg.get("new_browser") and holder["d"]:
-                    self.close_driver(holder["d"])
+                    self.close_driver(holder["d"], is_real_chrome=holder["real"])
                     holder["d"] = None
 
                 ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -1543,7 +1618,7 @@ class App(tk.Tk):
                 if scfg.get("url_delay", 0) > 0 and not self.stop_event.is_set():
                     time.sleep(scfg["url_delay"])
         finally:
-            self.close_driver(holder["d"])
+            self.close_driver(holder["d"], is_real_chrome=holder["real"])
 
     def run_job(self, links, cfg):
         q = self.msg_queue
@@ -1587,7 +1662,10 @@ class App(tk.Tk):
         n_workers = max(1, min(cfg["workers"], len(todo))) if todo else 0
         with open(out_path, "a", encoding="utf-8") as out:
             ctx["out"] = out
-            threads = [threading.Thread(target=self.worker_loop, args=(task_q, cfg, ctx), daemon=True) for _ in range(n_workers)]
+            threads = [
+                threading.Thread(target=self.worker_loop, args=(task_q, cfg, ctx, w_idx), daemon=True)
+                for w_idx in range(n_workers)
+            ]
             for t in threads:
                 t.start()
             for t in threads:
