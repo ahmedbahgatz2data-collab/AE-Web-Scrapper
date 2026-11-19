@@ -152,13 +152,33 @@ REC_JS = r"""
   var lastHovered = null;
   document.addEventListener('mouseover', function (e) {
     if (window.__recMode !== 'extract' && window.__recMode !== 'searchbox') return;
-    if (lastHovered) lastHovered.style.outline = '';
+    if (lastHovered) {
+      lastHovered.style.outline = '';
+      lastHovered = null;
+    }
+    if (e.altKey) return;
     lastHovered = e.target;
     lastHovered.style.outline = (window.__recMode === 'searchbox') ? '2px solid #1EA5FF' : '2px solid #FF8C00';
   }, true);
 
+  document.addEventListener('keydown', function (e) {
+    if (e.key === 'Alt' && lastHovered) {
+      lastHovered.style.outline = '';
+      lastHovered = null;
+    }
+  }, true);
+
   document.addEventListener('click', function (e) {
     try {
+      // Alt + Click: تخطي مؤقت للالتقاط والسماح للضغطة بالمرور للمتصفح (لإغلاق الكوكيز بانر أو فتح القوائم)
+      if (e.altKey) {
+        if (lastHovered) {
+          lastHovered.style.outline = '';
+          lastHovered = null;
+        }
+        return;
+      }
+
       var mode = window.__recMode || 'click';
       var t = e.target;
       if (mode === 'click') {
@@ -493,7 +513,7 @@ def num(var, default):
 
 ALL_SITES = "*"
 ALL_SITES_LABEL = "All sites (default)"
-APP_VERSION = "3.6.1-profile-clone"
+APP_VERSION = "3.6.2-alt-bypass"
 SITE_OPT_KEYS = (
     "load_wait", "step_timeout", "step_delay", "url_delay",
     "stop_loading", "stealth", "headless", "new_browser",
@@ -991,7 +1011,7 @@ class App(tk.Tk):
         self.txt_keywords.bind("<<Modified>>", self.on_kw_modified)
 
         # 2. Right Pane: Sequential Workflow
-        seq_box = ttk.LabelFrame(mid, text="2. Site Workflow (Drag & Drop rows to reorder)")
+        seq_box = ttk.LabelFrame(mid, text="2. Site Workflow (Drag & Drop rows to reorder | Hold Alt+Click in browser to bypass)")
         mid.add(seq_box, stretch="always", minsize=560)
         self.lst_seq = tk.Listbox(seq_box, height=8, activestyle="none", exportselection=False, **LIST_OPTS)
         self.lst_seq.pack(fill="both", expand=True, padx=6, pady=(6, 4))
