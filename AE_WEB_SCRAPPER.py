@@ -10,7 +10,9 @@ import queue
 import datetime
 import threading
 import zipfile
+import tempfile
 import urllib.parse
+import urllib.request
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, scrolledtext, simpledialog
 
@@ -31,6 +33,9 @@ BORDER = "#D9D9D9"
 TEXT = "#2B2B2B"
 GREEN_BG = "#E3F4D7"
 GREEN = "#62C93F"
+
+GITHUB_REPO = "ahmedbahgatz2data-collab/AE-Web-Scrapper"
+GITHUB_API_LATEST = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
 
 TEXT_OPTS = dict(
     relief="flat", borderwidth=0, highlightthickness=1,
@@ -170,7 +175,7 @@ REC_JS = r"""
 
   document.addEventListener('click', function (e) {
     try {
-      // Alt + Click: تخطي مؤقت للالتقاط والسماح للضغطة بالمرور للمتصفح (لإغلاق الكوكيز بانر أو فتح القوائم)
+      // Alt + Click: تخطي مؤقت للالتقاط والسماح للضغطة بالمرور للمتصفح
       if (e.altKey) {
         if (lastHovered) {
           lastHovered.style.outline = '';
@@ -271,6 +276,51 @@ if (el.tagName && el.tagName.toLowerCase() === 'select') {
   }, 300);
 }
 """
+
+
+def parse_ver_tuple(ver_str):
+    nums = re.findall(r"\d+", str(ver_str or ""))
+    return tuple(int(x) for x in nums) if nums else (0,)
+
+
+def schedule_silent_exe_replace(staged_exe_path, restart_after=False):
+    """ينشئ سكريبت .bat خفي ينتظر إغلاق البرنامج الحالي ثم يستبدل الـ .exe بالنسخة المحدثة."""
+    if not getattr(sys, "frozen", False):
+        return False
+    current_exe = os.path.abspath(sys.executable)
+    if not os.path.exists(staged_exe_path):
+        return False
+
+    pid = os.getpid()
+    bat_path = os.path.join(tempfile.gettempdir(), f"ae_scraper_upd_{pid}.bat")
+    restart_cmd = f'start "" "{current_exe}"\r\n' if restart_after else ""
+    bat_content = (
+        "@echo off\r\n"
+        ":waitloop\r\n"
+        f'tasklist /FI "PID eq {pid}" 2>NUL | find /I "{pid}" >NUL\r\n'
+        "if not errorlevel 1 (\r\n"
+        "  timeout /t 1 /nobreak >NUL\r\n"
+        "  goto waitloop\r\n"
+        ")\r\n"
+        "timeout /t 1 /nobreak >NUL\r\n"
+        f'move /y "{staged_exe_path}" "{current_exe}" >NUL 2>&1\r\n'
+        f"{restart_cmd}"
+        '(goto) 2>nul & del "%~f0"\r\n'
+    )
+    try:
+        with open(bat_path, "w", encoding="utf-8") as f:
+            f.write(bat_content)
+        creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+        subprocess.Popen(
+            ["cmd.exe", "/c", bat_path],
+            creationflags=creation_flags,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            close_fds=True,
+        )
+        return True
+    except Exception:
+        return False
 
 
 def find_system_chrome(custom_path=""):
@@ -513,7 +563,7 @@ def num(var, default):
 
 ALL_SITES = "*"
 ALL_SITES_LABEL = "All sites (default)"
-APP_VERSION = "3.6.2-alt-bypass"
+APP_VERSION = "3.6.3"
 SITE_OPT_KEYS = (
     "load_wait", "step_timeout", "step_delay", "url_delay",
     "stop_loading", "stealth", "headless", "new_browser",
@@ -612,7 +662,7 @@ def write_multi_sheet_xlsx(path, sheets_dict):
     parts = {
         "[Content_Types].xml": head
         + '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
-        '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
+        '<Default Extension="rels" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.relationships+xml"/>'
         '<Default Extension="xml" ContentType="application/xml"/>'
         '<Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>'
         '<Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/>'
@@ -691,6 +741,12 @@ class App(tk.Tk):
         self.opt_visible = True
         self.drag_index = None
 
+        # Auto-Update State
+        self.update_checking = False
+        self.staged_update_path = None
+        self.staged_update_version = None
+        self.restart_for_update = False
+
         self.sequence_sets = {ALL_SITES: []}
         self.site_settings = {}
         self.current_set = ALL_SITES
@@ -752,6 +808,8 @@ class App(tk.Tk):
         self.switch_input_mode()
         self.protocol("WM_DELETE_WINDOW", self.on_close)
         self.after(100, self.poll_queue)
+        # فحص تلقائي صامت للتحديثات عند فتح البرنامج
+        self.after(2000, lambda: self.trigger_update_check(manual=False))
 
     @property
     def sequence(self):
@@ -801,6 +859,70 @@ class App(tk.Tk):
                 json.dump(data, f, indent=2, ensure_ascii=False)
         except OSError:
             pass
+
+    # ----- GitHub Releases Silent Auto-Updater -----
+    def trigger_update_check(self, manual=False):
+        if self.update_checking:
+            if manual:
+                self.log("Update check already in progress...")
+            return
+        if self.staged_update_path and os.path.exists(self.staged_update_path):
+            if manual:
+                if messagebox.askyesno(
+                    "Update Ready",
+                    f"Version {self.staged_update_version} is already downloaded and ready.\n"
+                    f"Close and apply update now?\n(It will also apply automatically when you exit.)",
+                ):
+                    self.restart_for_update = False
+                    self.on_close()
+            return
+        self.update_checking = True
+        if manual:
+            self.btn_update.config(text="Checking...", state="disabled")
+        threading.Thread(target=self._update_worker, args=(manual,), daemon=True).start()
+
+    def _update_worker(self, manual=False):
+        try:
+            req = urllib.request.Request(
+                GITHUB_API_LATEST,
+                headers={"User-Agent": f"AE-Web-Scrapper/{APP_VERSION}", "Accept": "application/vnd.github+json"},
+            )
+            with urllib.request.urlopen(req, timeout=12) as resp:
+                release = json.loads(resp.read().decode("utf-8"))
+
+            tag = str(release.get("tag_name") or release.get("name") or "").strip()
+            latest_clean = tag.lstrip("vV")
+            if not latest_clean or parse_ver_tuple(latest_clean) <= parse_ver_tuple(APP_VERSION):
+                self.msg_queue.put(("update_result", {"status": "up_to_date", "manual": manual, "ver": tag or APP_VERSION}))
+                return
+
+            assets = release.get("assets") or []
+            exe_asset = next((a for a in assets if str(a.get("name", "")).lower().endswith(".exe")), None)
+            if not exe_asset:
+                self.msg_queue.put(("update_result", {"status": "no_asset", "manual": manual, "ver": tag}))
+                return
+
+            if not getattr(sys, "frozen", False):
+                self.msg_queue.put(("update_result", {"status": "dev_mode", "manual": manual, "ver": tag}))
+                return
+
+            dl_url = exe_asset.get("browser_download_url")
+            staged_path = os.path.join(tempfile.gettempdir(), f"AE-Web-Scrapper_v{latest_clean}.exe")
+            tmp_part = staged_path + ".part"
+
+            dl_req = urllib.request.Request(dl_url, headers={"User-Agent": f"AE-Web-Scrapper/{APP_VERSION}"})
+            with urllib.request.urlopen(dl_req, timeout=180) as r, open(tmp_part, "wb") as out_f:
+                shutil.copyfileobj(r, out_f)
+            os.replace(tmp_part, staged_path)
+
+            self.msg_queue.put(("update_result", {
+                "status": "staged",
+                "manual": manual,
+                "ver": tag,
+                "path": staged_path,
+            }))
+        except Exception as e:
+            self.msg_queue.put(("update_result", {"status": "error", "manual": manual, "err": str(e)}))
 
     def export_settings_file(self):
         self.save_settings()
@@ -862,6 +984,8 @@ class App(tk.Tk):
 
         self.btn_options = ttk.Button(tb, text="", style="Toolbar.TButton", command=self.toggle_options)
         self.btn_options.pack(side="right")
+        self.btn_update = ttk.Button(tb, text="Check Update", style="Toolbar.TButton", command=lambda: self.trigger_update_check(manual=True))
+        self.btn_update.pack(side="right", padx=(0, 8))
         self.btn_export = ttk.Button(tb, text="Export Excel (Multi-Sheet)", style="Toolbar.TButton", command=self.export_excel)
         self.btn_export.pack(side="right", padx=(0, 8))
         self.btn_folder = ttk.Button(tb, text="Open folder", style="Toolbar.TButton", command=self.open_folder)
@@ -1679,6 +1803,34 @@ class App(tk.Tk):
                     self.btn_stop.config(state="disabled")
                     self.btn_rec_click.config(state="normal")
                     self.btn_rec_extract.config(state="normal")
+                elif kind == "update_result":
+                    self.update_checking = False
+                    self.btn_update.config(text="Check Update", state="normal")
+                    st = data.get("status")
+                    manual = data.get("manual", False)
+                    if st == "staged":
+                        self.staged_update_path = data["path"]
+                        self.staged_update_version = data["ver"]
+                        self.btn_update.config(text=f"Update Ready ({data['ver']})")
+                        self.log(f"[Auto-Update] {data['ver']} downloaded silently. It will install automatically when you close the app.")
+                        if manual:
+                            if messagebox.askyesno(
+                                "Update Ready",
+                                f"Version {data['ver']} has been downloaded.\n"
+                                f"Close now to apply the update immediately?\n"
+                                f"(Otherwise it will apply automatically when you exit.)",
+                            ):
+                                self.restart_for_update = False
+                                self.on_close()
+                                return
+                    elif st == "up_to_date" and manual:
+                        messagebox.showinfo("Check Update", f"You are running the latest version (v{APP_VERSION}).")
+                    elif st == "dev_mode" and manual:
+                        messagebox.showinfo("Check Update", f"New version {data['ver']} is available on GitHub (running from .py source).")
+                    elif st == "no_asset" and manual:
+                        messagebox.showinfo("Check Update", f"Release {data['ver']} found on GitHub, but no .exe asset is attached yet.")
+                    elif st == "error" and manual:
+                        messagebox.showwarning("Check Update", f"Could not check for updates:\n{data.get('err', '')}")
                 elif kind == "rec_event":
                     m = data.get("type")
                     if m == "searchbox":
@@ -1775,6 +1927,8 @@ class App(tk.Tk):
                     d.quit()
                 except Exception:
                     pass
+        if self.staged_update_path and os.path.exists(self.staged_update_path):
+            schedule_silent_exe_replace(self.staged_update_path, restart_after=self.restart_for_update)
         self.destroy()
 
     # ----- Execution Engine -----
