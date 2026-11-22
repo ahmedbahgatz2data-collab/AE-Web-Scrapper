@@ -407,7 +407,7 @@ def sync_profile_to_isolated_dir(src_profile_path, port):
     return isolated_root, prof_name
 
 
-def launch_real_chrome(port=9222, headless=False, chrome_path="", custom_profile=""):
+def launch_real_chrome(port=9222, headless=False, chrome_path="", custom_profile="", incognito=False):
     if is_port_open(port):
         return True, f"Connected to running Chrome on port {port}"
 
@@ -415,7 +415,12 @@ def launch_real_chrome(port=9222, headless=False, chrome_path="", custom_profile
     if not chrome_exe:
         return False, "Could not find chrome.exe automatically. Please select chrome.exe in Global Options."
 
-    if custom_profile and custom_profile.strip() and os.path.exists(custom_profile.strip()):
+    if incognito:
+        base = os.environ.get("APPDATA") or os.path.join(os.path.expanduser("~"), ".config")
+        user_data_dir = os.path.join(base, "WebScraperTool", f"IncognitoProfile_{port}")
+        os.makedirs(user_data_dir, exist_ok=True)
+        profile_sub = None
+    elif custom_profile and custom_profile.strip() and os.path.exists(custom_profile.strip()):
         user_data_dir, profile_sub = sync_profile_to_isolated_dir(custom_profile, port)
     else:
         base = os.environ.get("APPDATA") or os.path.join(os.path.expanduser("~"), ".config")
@@ -432,6 +437,8 @@ def launch_real_chrome(port=9222, headless=False, chrome_path="", custom_profile
         "--disable-background-networking",
         "--start-maximized",
     ]
+    if incognito:
+        cmd.append("--incognito")
     if profile_sub:
         cmd.append(f"--profile-directory={profile_sub}")
     if headless:
@@ -445,8 +452,8 @@ def launch_real_chrome(port=9222, headless=False, chrome_path="", custom_profile
 
     for _ in range(45):
         if is_port_open(port):
-            prof_msg = f" [Cloned Profile: {profile_sub}]" if profile_sub else ""
-            return True, f"Launched Real Chrome{prof_msg} on port {port}"
+            mode_tag = " [Incognito]" if incognito else (f" [Cloned Profile: {profile_sub}]" if profile_sub else "")
+            return True, f"Launched Real Chrome{mode_tag} on port {port}"
         time.sleep(0.2)
     return False, f"Chrome launched but port {port} did not open. Try clicking 'Kill Chrome' first."
 
@@ -563,10 +570,10 @@ def num(var, default):
 
 ALL_SITES = "*"
 ALL_SITES_LABEL = "All sites (default)"
-APP_VERSION = "4.0.1"
+APP_VERSION = "4.0.2"
 SITE_OPT_KEYS = (
     "load_wait", "step_timeout", "step_delay", "url_delay",
-    "stop_loading", "stealth", "headless", "new_browser",
+    "stop_loading", "stealth", "headless", "incognito", "new_browser",
     "use_real_chrome", "zoom_pct"
 )
 
@@ -662,7 +669,7 @@ def write_multi_sheet_xlsx(path, sheets_dict):
     parts = {
         "[Content_Types].xml": head
         + '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
-        '<Default Extension="rels" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.relationships+xml"/>'
+        '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
         '<Default Extension="xml" ContentType="application/xml"/>'
         '<Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>'
         '<Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/>'
@@ -682,7 +689,7 @@ def write_multi_sheet_xlsx(path, sheets_dict):
         "xl/_rels/workbook.xml.rels": head + f'<Relationships xmlns="{ns_pkg}">'
         + "".join(
             f'<Relationship Id="rId{i}" Type="{ns_rel}/worksheet" Target="worksheets/sheet{i}.xml"/>'
-            for i in range(1, len(sheet_entries) + 1)
+            for i, (sname, _) in enumerate(sheet_entries, 1)
         )
         + f'<Relationship Id="rId{len(sheet_entries) + 1}" Type="{ns_rel}/styles" Target="styles.xml"/></Relationships>',
         "xl/styles.xml": head + f'<styleSheet xmlns="{ns_main}">'
@@ -773,6 +780,7 @@ class App(tk.Tk):
         self.var_dedupe = tk.BooleanVar(value=True)
         self.var_browser_mode = tk.StringVar(value="single")
         self.var_headless = tk.BooleanVar(value=False)
+        self.var_incognito = tk.BooleanVar(value=False)
         self.var_stealth = tk.BooleanVar(value=False)
         self.var_url_delay = tk.DoubleVar(value=0)
         self.var_step_timeout = tk.DoubleVar(value=10)
@@ -791,7 +799,8 @@ class App(tk.Tk):
             "search_input_sel": self.var_search_input_sel, "search_btn_sel": self.var_search_btn_sel,
             "load_wait": self.var_load_wait, "stop_loading": self.var_stop_loading,
             "dedupe": self.var_dedupe, "browser_mode": self.var_browser_mode,
-            "headless": self.var_headless, "stealth": self.var_stealth,
+            "headless": self.var_headless, "incognito": self.var_incognito,
+            "stealth": self.var_stealth,
             "url_delay": self.var_url_delay, "step_timeout": self.var_step_timeout,
             "step_delay": self.var_step_delay, "continue": self.var_continue,
             "retries": self.var_retries, "workers": self.var_workers,
@@ -1049,6 +1058,7 @@ class App(tk.Tk):
         r3 = ttk.Frame(box)
         r3.grid(row=3, column=0, columnspan=3, sticky="ew", **pad)
         ttk.Checkbutton(r3, text="Close browser when finished", variable=self.var_close_on_finish).pack(side="left", padx=(0, 10))
+        ttk.Checkbutton(r3, text="Incognito", variable=self.var_incognito, command=self.update_summary).pack(side="left", padx=(0, 10))
         ttk.Checkbutton(r3, text="Headless", variable=self.var_headless).pack(side="left", padx=(0, 10))
         ttk.Checkbutton(r3, text="Reuse browser", variable=self.var_browser_mode, onvalue="single", offvalue="each").pack(side="left", padx=(0, 10))
         ttk.Checkbutton(r3, text="Stop loading early", variable=self.var_stop_loading).pack(side="left", padx=(0, 10))
@@ -1247,8 +1257,9 @@ class App(tk.Tk):
         extract_count = sum(1 for item in self.sequence if item["type"] == "extract")
         mode_lbl = "Search Mode" if self.var_input_mode.get() == "search" else "URLs Mode"
         engine_txt = f"Real Chrome (:{num(self.var_debug_port, 9222)})" if self.var_use_real_chrome.get() else "Auto ChromeDriver"
+        inc_txt = "   \u00B7   Incognito: ON" if self.var_incognito.get() else ""
         self.lbl_summary.config(
-            text=f"Mode: {mode_lbl}   \u00B7   Engine: {engine_txt}   \u00B7   Zoom: {num(self.var_zoom_pct, 100)}%   \u00B7   Steps: {len(self.sequence)} ({extract_count} fields)"
+            text=f"Mode: {mode_lbl}   \u00B7   Engine: {engine_txt}{inc_txt}   \u00B7   Zoom: {num(self.var_zoom_pct, 100)}%   \u00B7   Steps: {len(self.sequence)} ({extract_count} fields)"
         )
         if self.current_set == ALL_SITES:
             self.lbl_site_info.config(text="Using Global Options")
@@ -1457,6 +1468,7 @@ class App(tk.Tk):
         v_sdel = tk.DoubleVar(value=cur.get("step_delay", num(self.var_step_delay, 1.5)))
         v_udel = tk.DoubleVar(value=cur.get("url_delay", num(self.var_url_delay, 0)))
         v_zoom = tk.IntVar(value=cur.get("zoom_pct", num(self.var_zoom_pct, 100)))
+        v_inc = tk.BooleanVar(value=cur.get("incognito", self.var_incognito.get()))
         v_head = tk.BooleanVar(value=cur.get("headless", self.var_headless.get()))
         v_stel = tk.BooleanVar(value=cur.get("stealth", self.var_stealth.get()))
         v_stop = tk.BooleanVar(value=cur.get("stop_loading", self.var_stop_loading.get()))
@@ -1481,10 +1493,11 @@ class App(tk.Tk):
         ttk.Spinbox(dlg, from_=25, to=200, increment=10, width=8, textvariable=v_zoom).grid(row=5, column=1, sticky="w", **pad)
 
         ttk.Checkbutton(dlg, text="Use Real Chrome Browser Directly", variable=v_real).grid(row=6, column=0, columnspan=2, sticky="w", **pad)
-        ttk.Checkbutton(dlg, text="Hidden Browser (Headless)", variable=v_head).grid(row=7, column=0, columnspan=2, sticky="w", **pad)
-        ttk.Checkbutton(dlg, text="Stealth Mode (Anti-Bot)", variable=v_stel).grid(row=8, column=0, columnspan=2, sticky="w", **pad)
-        ttk.Checkbutton(dlg, text="Stop loading early", variable=v_stop).grid(row=9, column=0, columnspan=2, sticky="w", **pad)
-        ttk.Checkbutton(dlg, text="Reopen fresh browser for every URL", variable=v_newb).grid(row=10, column=0, columnspan=2, sticky="w", **pad)
+        ttk.Checkbutton(dlg, text="Incognito Mode", variable=v_inc).grid(row=7, column=0, columnspan=2, sticky="w", **pad)
+        ttk.Checkbutton(dlg, text="Hidden Browser (Headless)", variable=v_head).grid(row=8, column=0, columnspan=2, sticky="w", **pad)
+        ttk.Checkbutton(dlg, text="Stealth Mode (Anti-Bot)", variable=v_stel).grid(row=9, column=0, columnspan=2, sticky="w", **pad)
+        ttk.Checkbutton(dlg, text="Stop loading early", variable=v_stop).grid(row=10, column=0, columnspan=2, sticky="w", **pad)
+        ttk.Checkbutton(dlg, text="Reopen fresh browser for every URL", variable=v_newb).grid(row=11, column=0, columnspan=2, sticky="w", **pad)
 
         def save_site_opts():
             if not v_use.get():
@@ -1497,6 +1510,7 @@ class App(tk.Tk):
                     "step_delay": float(v_sdel.get()),
                     "url_delay": float(v_udel.get()),
                     "zoom_pct": int(v_zoom.get()),
+                    "incognito": bool(v_inc.get()),
                     "headless": bool(v_head.get()),
                     "stealth": bool(v_stel.get()),
                     "stop_loading": bool(v_stop.get()),
@@ -1506,7 +1520,7 @@ class App(tk.Tk):
             self.update_summary()
 
         btns = ttk.Frame(dlg)
-        btns.grid(row=11, column=0, columnspan=2, sticky="e", padx=12, pady=10)
+        btns.grid(row=12, column=0, columnspan=2, sticky="e", padx=12, pady=10)
         ttk.Button(btns, text="Save", style="Accent.TButton", command=save_site_opts).pack(side="left")
         ttk.Button(btns, text="Cancel", command=dlg.destroy).pack(side="left", padx=6)
         dlg.grab_set()
@@ -1613,7 +1627,7 @@ class App(tk.Tk):
             return
         is_multi = messagebox.askyesno("Extraction Mode", "Does this selector match MULTIPLE repeating items on the same page?")
         is_both = messagebox.askyesno("Data Type", "Extract BOTH Text and Link into 2 separate columns?")
-        attr = "both" if is_both else ("href" if messagebox.askyesno("Link Only", "Extract LINK (href) only?") else "text")
+        attr = "both" if is_both else ("href" if messagebox.askyesno("Link Only", "Extract ONLY the Link URL (href)?") else "text")
         self.sequence.append({
             "type": "extract",
             "name": name.strip(),
@@ -1716,6 +1730,7 @@ class App(tk.Tk):
             "chrome_profile": self.var_chrome_profile.get().strip(),
             "use_real_chrome": self.var_use_real_chrome.get(),
             "debug_port": num(self.var_debug_port, 9222),
+            "incognito": self.var_incognito.get(),
             "stealth": self.var_stealth.get(),
         }
         threading.Thread(target=self.record_worker, args=(url, mode, rec_cfg), daemon=True).start()
@@ -1733,6 +1748,7 @@ class App(tk.Tk):
     def record_worker(self, url, mode, rec_cfg):
         driver = None
         is_real = bool(rec_cfg.get("use_real_chrome"))
+        incognito = bool(rec_cfg.get("incognito"))
         try:
             options = webdriver.ChromeOptions()
             options.set_capability("goog:loggingPrefs", {"browser": "ALL"})
@@ -1744,6 +1760,7 @@ class App(tk.Tk):
                     headless=False,
                     chrome_path=rec_cfg.get("chrome_exe", ""),
                     custom_profile=rec_cfg.get("chrome_profile", ""),
+                    incognito=incognito,
                 )
                 self.msg_queue.put(("log", msg))
                 if not ok:
@@ -1752,6 +1769,8 @@ class App(tk.Tk):
                 driver = webdriver.Chrome(service=make_service(rec_cfg["driver"]), options=options)
             else:
                 options.add_argument("--start-maximized")
+                if incognito:
+                    options.add_argument("--incognito")
                 if rec_cfg.get("stealth"):
                     apply_stealth_options(options)
                 driver = webdriver.Chrome(service=make_service(rec_cfg["driver"]), options=options)
@@ -1985,6 +2004,7 @@ class App(tk.Tk):
             "site_settings": json.loads(json.dumps(self.site_settings)),
             "new_browser": self.var_browser_mode.get() == "each",
             "headless": self.var_headless.get(),
+            "incognito": self.var_incognito.get(),
             "stealth": self.var_stealth.get(),
             "url_delay": num(self.var_url_delay, 0),
             "retries": max(0, num(self.var_retries, 2)),
@@ -2049,6 +2069,7 @@ class App(tk.Tk):
     def new_driver(self, scfg, worker_idx=0):
         options = webdriver.ChromeOptions()
         options.page_load_strategy = "none"
+        incognito = bool(scfg.get("incognito"))
 
         if scfg.get("use_real_chrome"):
             port = int(scfg.get("debug_port", 9222)) + worker_idx
@@ -2057,6 +2078,7 @@ class App(tk.Tk):
                 headless=scfg.get("headless", False),
                 chrome_path=scfg.get("chrome_exe", ""),
                 custom_profile=scfg.get("chrome_profile", ""),
+                incognito=incognito,
             )
             self.msg_queue.put(("log", f"   {msg}"))
             if not ok:
@@ -2067,6 +2089,8 @@ class App(tk.Tk):
             return driver
 
         options.add_argument("--start-maximized")
+        if incognito:
+            options.add_argument("--incognito")
         if scfg.get("headless"):
             options.add_argument("--headless=new")
             options.add_argument("--window-size=1920,1080")
@@ -2239,7 +2263,7 @@ class App(tk.Tk):
                 site_key = resolve_site_key(cfg["sequence_sets"], link)
                 scfg = apply_site_cfg(cfg, link)
                 seq = cfg["sequence_sets"].get(site_key, [])
-                driver_sig = (scfg.get("headless"), scfg.get("stealth"), scfg.get("use_real_chrome"))
+                driver_sig = (scfg.get("headless"), scfg.get("incognito"), scfg.get("stealth"), scfg.get("use_real_chrome"))
 
                 if holder["d"] is not None and holder["sig"] != driver_sig:
                     self.close_driver(holder["d"], is_real_chrome=holder["real"], force_close=True)
