@@ -284,7 +284,7 @@ def parse_ver_tuple(ver_str):
 
 
 def schedule_silent_exe_replace(staged_exe_path, restart_after=False):
-    """ينشئ سكريبت .bat خفي ينتظر إغلاق البرنامج الحالي ثم يستبدل الـ .exe بالنسخة المحدثة."""
+    """ينشئ سكريبت .bat خفي ينتظر إغلاق البرنامج الحالي وتحرير الملف ثم يستبدل الـ .exe."""
     if not getattr(sys, "frozen", False):
         return False
     current_exe = os.path.abspath(sys.executable)
@@ -293,17 +293,29 @@ def schedule_silent_exe_replace(staged_exe_path, restart_after=False):
 
     pid = os.getpid()
     bat_path = os.path.join(tempfile.gettempdir(), f"ae_scraper_upd_{pid}.bat")
+    log_path = os.path.join(tempfile.gettempdir(), f"ae_scraper_upd_{pid}.log")
     restart_cmd = f'start "" "{current_exe}"\r\n' if restart_after else ""
+
     bat_content = (
         "@echo off\r\n"
+        f'echo Starting update at %date% %time% > "{log_path}"\r\n'
         ":waitloop\r\n"
         f'tasklist /FI "PID eq {pid}" 2>NUL | find /I "{pid}" >NUL\r\n'
         "if not errorlevel 1 (\r\n"
         "  timeout /t 1 /nobreak >NUL\r\n"
         "  goto waitloop\r\n"
         ")\r\n"
-        "timeout /t 1 /nobreak >NUL\r\n"
-        f'move /y "{staged_exe_path}" "{current_exe}" >NUL 2>&1\r\n'
+        "timeout /t 3 /nobreak >NUL\r\n"
+        "set /a tries=0\r\n"
+        ":moveloop\r\n"
+        "set /a tries+=1\r\n"
+        f'move /y "{staged_exe_path}" "{current_exe}" >> "{log_path}" 2>&1\r\n'
+        "if errorlevel 1 (\r\n"
+        "  if %tries% LSS 15 (\r\n"
+        "    timeout /t 1 /nobreak >NUL\r\n"
+        "    goto moveloop\r\n"
+        "  )\r\n"
+        ")\r\n"
         f"{restart_cmd}"
         '(goto) 2>nul & del "%~f0"\r\n'
     )
@@ -570,7 +582,7 @@ def num(var, default):
 
 ALL_SITES = "*"
 ALL_SITES_LABEL = "All sites (default)"
-APP_VERSION = "4.0.2"
+APP_VERSION = "4.0.3"
 SITE_OPT_KEYS = (
     "load_wait", "step_timeout", "step_delay", "url_delay",
     "stop_loading", "stealth", "headless", "incognito", "new_browser",
@@ -689,7 +701,7 @@ def write_multi_sheet_xlsx(path, sheets_dict):
         "xl/_rels/workbook.xml.rels": head + f'<Relationships xmlns="{ns_pkg}">'
         + "".join(
             f'<Relationship Id="rId{i}" Type="{ns_rel}/worksheet" Target="worksheets/sheet{i}.xml"/>'
-            for i, (sname, _) in enumerate(sheet_entries, 1)
+            for i in range(1, len(sheet_entries) + 1)
         )
         + f'<Relationship Id="rId{len(sheet_entries) + 1}" Type="{ns_rel}/styles" Target="styles.xml"/></Relationships>',
         "xl/styles.xml": head + f'<styleSheet xmlns="{ns_main}">'
