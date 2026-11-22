@@ -563,7 +563,7 @@ def num(var, default):
 
 ALL_SITES = "*"
 ALL_SITES_LABEL = "All sites (default)"
-APP_VERSION = "3.6.3"
+APP_VERSION = "3.6.4"
 SITE_OPT_KEYS = (
     "load_wait", "step_timeout", "step_delay", "url_delay",
     "stop_loading", "stealth", "headless", "new_browser",
