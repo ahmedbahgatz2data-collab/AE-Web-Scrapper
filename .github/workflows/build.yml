@@ -1,6 +1,5 @@
 name: Build exe and auto-release
 
-# يعمل تلقائياً عند أي تعديل على الكود أو عند التشغيل اليدوي من تبويب Actions
 on:
   workflow_dispatch:
   push:
@@ -30,17 +29,31 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           $version = python -c "import re; s=open('AE_WEB_SCRAPPER.py', encoding='utf-8').read(); m=re.search(r'APP_VERSION\s*=\s*[\x22\x27]([^\x22\x27]+)[\x22\x27]', s); print(m.group(1).lstrip('vV') if m else '')"
-          if (-not $version) {
+          $version = $version.Trim()
+          if ([string]::IsNullOrWhiteSpace($version)) {
             Write-Error "APP_VERSION not found in AE_WEB_SCRAPPER.py"
             exit 1
           }
           $tag = "v$version"
-          gh release view $tag *> $null
-          $exists = ($LASTEXITCODE -eq 0)
-          echo "version=$version" >> $env:GITHUB_OUTPUT
-          echo "tag=$tag" >> $env:GITHUB_OUTPUT
-          echo "exists=$exists" >> $env:GITHUB_OUTPUT
-          Write-Host "Detected version: $tag | Already released: $exists"
+          $exists = "False"
+          try {
+            $headers = @{
+              Authorization = "Bearer $env:GH_TOKEN"
+              Accept = "application/vnd.github+json"
+              "User-Agent" = "GitHub-Actions-Release-Check"
+            }
+            $uri = "https://api.github.com/repos/${{ github.repository }}/releases/tags/$tag"
+            $null = Invoke-RestMethod -Uri $uri -Headers $headers -Method Get -ErrorAction Stop
+            $exists = "True"
+          } catch {
+            $exists = "False"
+          }
+
+          "version=$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "tag=$tag" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "exists=$exists" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          Write-Output "Detected version: $tag | Already released: $exists"
+          exit 0
 
       - name: Install dependencies
         if: steps.ver.outputs.exists == 'False' || github.event_name == 'workflow_dispatch'
