@@ -175,7 +175,6 @@ REC_JS = r"""
 
   document.addEventListener('click', function (e) {
     try {
-      // Alt + Click: تخطي مؤقت للالتقاط والسماح للضغطة بالمرور للمتصفح
       if (e.altKey) {
         if (lastHovered) {
           lastHovered.style.outline = '';
@@ -284,7 +283,6 @@ def parse_ver_tuple(ver_str):
 
 
 def schedule_silent_exe_replace(staged_exe_path, restart_after=False):
-    """ينشئ سكريبت .bat خفي ينتظر إغلاق البرنامج الحالي وتحرير الملف ثم يستبدل الـ .exe."""
     if not getattr(sys, "frozen", False):
         return False
     current_exe = os.path.abspath(sys.executable)
@@ -374,10 +372,6 @@ def is_port_open(port):
 
 
 def sync_profile_to_isolated_dir(src_profile_path, port):
-    """
-    ينسخ ملفات الجلسة والكوكيز من بروفايل كروم الشخصي إلى مجلد معزول
-    لتجنب قفل الملفات (File Lock) وقيود أمان منفذ 9222 في كروم.
-    """
     base = os.environ.get("APPDATA") or os.path.join(os.path.expanduser("~"), ".config")
     isolated_root = os.path.join(base, "WebScraperTool", f"IsolatedProfile_{port}")
 
@@ -582,7 +576,8 @@ def num(var, default):
 
 ALL_SITES = "*"
 ALL_SITES_LABEL = "All sites (default)"
-APP_VERSION = "4.0.3"
+DEFAULT_MODULE = "Default"
+APP_VERSION = "4.1.0"
 SITE_OPT_KEYS = (
     "load_wait", "step_timeout", "step_delay", "url_delay",
     "stop_loading", "stealth", "headless", "incognito", "new_browser",
@@ -611,16 +606,87 @@ def host_matches(host, key):
     return bool(key) and (host == key or host.endswith("." + key))
 
 
-def resolve_site_key(sets_dict, url):
+def normalize_site_entry(entry):
+    if isinstance(entry, list):
+        return {
+            "active_module": DEFAULT_MODULE,
+            "modules": {
+                DEFAULT_MODULE: {"pattern": "", "steps": entry}
+            },
+        }
+    if isinstance(entry, dict) and isinstance(entry.get("modules"), dict):
+        mods = entry["modules"]
+        if not mods:
+            mods[DEFAULT_MODULE] = {"pattern": "", "steps": []}
+        for mname, mval in list(mods.items()):
+            if isinstance(mval, list):
+                mods[mname] = {"pattern": "", "steps": mval}
+            elif isinstance(mval, dict):
+                mval.setdefault("pattern", "")
+                mval.setdefault("steps", [])
+            else:
+                mods[mname] = {"pattern": "", "steps": []}
+        act = entry.get("active_module")
+        if act not in mods:
+            act = next(iter(mods))
+        return {"active_module": act, "modules": mods}
+    return {
+        "active_module": DEFAULT_MODULE,
+        "modules": {DEFAULT_MODULE: {"pattern": "", "steps": []}},
+    }
+
+
+def url_matches_pattern(url, pattern):
+    pat = (pattern or "").strip()
+    if not pat:
+        return False
+    low_u = url.lower()
+    for part in pat.split("|"):
+        p = part.strip()
+        if not p:
+            continue
+        if p.lower().startswith("re:"):
+            try:
+                if re.search(p[3:].strip(), url, re.IGNORECASE):
+                    return True
+            except re.error:
+                pass
+        elif p.lower() in low_u:
+            return True
+    return False
+
+
+def resolve_site_and_module(sets_dict, url):
     host = host_of(url)
     best = None
     for key in sets_dict:
         if key != ALL_SITES and host_matches(host, key):
             if best is None or len(key) > len(best):
                 best = key
-    if best is not None and sets_dict[best]:
-        return best
-    return ALL_SITES
+
+    chosen_site = ALL_SITES
+    if best is not None:
+        entry = normalize_site_entry(sets_dict[best])
+        has_any_steps = any(m.get("steps") for m in entry["modules"].values())
+        if has_any_steps:
+            chosen_site = best
+
+    entry = normalize_site_entry(sets_dict.get(chosen_site))
+    mods = entry["modules"]
+
+    for mname, mdata in mods.items():
+        if mdata.get("steps") and url_matches_pattern(url, mdata.get("pattern", "")):
+            return chosen_site, mname, mdata.get("steps", [])
+
+    act = entry.get("active_module", DEFAULT_MODULE)
+    if act not in mods:
+        act = next(iter(mods))
+    steps = mods[act].get("steps", [])
+    if not steps:
+        for mname, mdata in mods.items():
+            if mdata.get("steps"):
+                return chosen_site, mname, mdata.get("steps", [])
+    return chosen_site, act, steps
 
 
 def apply_site_cfg(base_cfg, url):
@@ -701,7 +767,7 @@ def write_multi_sheet_xlsx(path, sheets_dict):
         "xl/_rels/workbook.xml.rels": head + f'<Relationships xmlns="{ns_pkg}">'
         + "".join(
             f'<Relationship Id="rId{i}" Type="{ns_rel}/worksheet" Target="worksheets/sheet{i}.xml"/>'
-            for i in range(1, len(sheet_entries) + 1)
+            for i, (sname, _) in enumerate(sheet_entries, 1)
         )
         + f'<Relationship Id="rId{len(sheet_entries) + 1}" Type="{ns_rel}/styles" Target="styles.xml"/></Relationships>',
         "xl/styles.xml": head + f'<styleSheet xmlns="{ns_main}">'
@@ -747,8 +813,8 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title(f"Multi-Site Sequential Web Scraper Pro  v{APP_VERSION}")
-        self.geometry("1220x860")
-        self.minsize(1020, 700)
+        self.geometry("1240x880")
+        self.minsize(1040, 720)
 
         self.msg_queue = queue.Queue()
         self.stop_event = threading.Event()
@@ -760,13 +826,12 @@ class App(tk.Tk):
         self.opt_visible = True
         self.drag_index = None
 
-        # Auto-Update State
         self.update_checking = False
         self.staged_update_path = None
         self.staged_update_version = None
-        self.restart_for_update = False
+        self.restart_for_update = True
 
-        self.sequence_sets = {ALL_SITES: []}
+        self.sequence_sets = {ALL_SITES: normalize_site_entry([])}
         self.site_settings = {}
         self.current_set = ALL_SITES
         self.saved_links = ""
@@ -780,8 +845,8 @@ class App(tk.Tk):
         self.var_debug_port = tk.IntVar(value=9222)
         self.var_close_on_finish = tk.BooleanVar(value=True)
         self.var_zoom_pct = tk.IntVar(value=100)
+        self.var_mod_pattern = tk.StringVar()
 
-        # Search Mode Variables
         self.var_input_mode = tk.StringVar(value="urls")
         self.var_search_url = tk.StringVar()
         self.var_search_input_sel = tk.StringVar()
@@ -829,16 +894,38 @@ class App(tk.Tk):
         self.switch_input_mode()
         self.protocol("WM_DELETE_WINDOW", self.on_close)
         self.after(100, self.poll_queue)
-        # فحص تلقائي صامت للتحديثات عند فتح البرنامج
         self.after(2000, lambda: self.trigger_update_check(manual=False))
+
+    def get_site_entry(self, site_key=None):
+        sk = site_key if site_key is not None else self.current_set
+        if sk not in self.sequence_sets:
+            self.sequence_sets[sk] = normalize_site_entry([])
+        else:
+            self.sequence_sets[sk] = normalize_site_entry(self.sequence_sets[sk])
+        return self.sequence_sets[sk]
+
+    @property
+    def current_module(self):
+        entry = self.get_site_entry()
+        return entry["active_module"]
+
+    @current_module.setter
+    def current_module(self, mod_name):
+        entry = self.get_site_entry()
+        if mod_name not in entry["modules"]:
+            entry["modules"][mod_name] = {"pattern": "", "steps": []}
+        entry["active_module"] = mod_name
 
     @property
     def sequence(self):
-        return self.sequence_sets.setdefault(self.current_set, [])
+        entry = self.get_site_entry()
+        mod = entry["modules"][entry["active_module"]]
+        return mod.setdefault("steps", [])
 
     @sequence.setter
     def sequence(self, value):
-        self.sequence_sets[self.current_set] = value
+        entry = self.get_site_entry()
+        entry["modules"][entry["active_module"]]["steps"] = value
 
     def load_settings(self):
         try:
@@ -855,12 +942,15 @@ class App(tk.Tk):
                 except Exception:
                     pass
         if isinstance(data.get("sequence_sets"), dict):
-            self.sequence_sets = data["sequence_sets"]
-            self.sequence_sets.setdefault(ALL_SITES, [])
+            self.sequence_sets = {
+                k: normalize_site_entry(v) for k, v in data["sequence_sets"].items()
+            }
+            self.sequence_sets.setdefault(ALL_SITES, normalize_site_entry([]))
         if isinstance(data.get("site_settings"), dict):
             self.site_settings = data["site_settings"]
         if data.get("current_set") in (set(self.sequence_sets) | set(self.site_settings)):
             self.current_set = data["current_set"]
+            self.get_site_entry(self.current_set)
         if isinstance(data.get("links"), str):
             self.saved_links = data["links"]
         if isinstance(data.get("keywords"), str):
@@ -881,7 +971,6 @@ class App(tk.Tk):
         except OSError:
             pass
 
-    # ----- GitHub Releases Silent Auto-Updater -----
     def trigger_update_check(self, manual=False):
         if self.update_checking:
             if manual:
@@ -894,7 +983,7 @@ class App(tk.Tk):
                     f"Version {self.staged_update_version} is already downloaded and ready.\n"
                     f"Close and apply update now?\n(It will also apply automatically when you exit.)",
                 ):
-                    self.restart_for_update = False
+                    self.restart_for_update = True
                     self.on_close()
             return
         self.update_checking = True
@@ -991,7 +1080,6 @@ class App(tk.Tk):
         self.apply_theme()
         pad = {"padx": 8, "pady": 3}
 
-        # ----- Toolbar -----
         self.toolbar = ttk.Frame(self, style="Toolbar.TFrame")
         self.toolbar.pack(side="top", fill="x")
         tb = ttk.Frame(self.toolbar, style="Toolbar.TFrame")
@@ -1012,7 +1100,6 @@ class App(tk.Tk):
         self.btn_folder = ttk.Button(tb, text="Open folder", style="Toolbar.TButton", command=self.open_folder)
         self.btn_folder.pack(side="right", padx=(0, 8))
 
-        # ----- Status bar -----
         status_line = ttk.Frame(self, style="StatusLine.TFrame", height=4)
         status_line.pack(side="bottom", fill="x")
         status = ttk.Frame(self, style="Status.TFrame")
@@ -1024,19 +1111,16 @@ class App(tk.Tk):
         self.progress = ttk.Progressbar(status, mode="determinate")
         self.progress.pack(side="left", fill="x", expand=True, padx=(0, 6))
 
-        # ----- Global Options Panel -----
         box = ttk.LabelFrame(self, text="Global Scraper Options (Browser, Profile, Zoom & Timings)")
         self.opt_box = box
         box.columnconfigure(1, weight=1)
 
-        # Row 0: Save Folder
         r0 = ttk.Frame(box)
         r0.grid(row=0, column=0, columnspan=3, sticky="ew", **pad)
         ttk.Label(r0, text="Save folder:").pack(side="left")
         ttk.Entry(r0, textvariable=self.var_folder).pack(side="left", fill="x", expand=True, padx=6)
         ttk.Button(r0, text="Browse...", command=self.pick_folder).pack(side="left")
 
-        # Row 1: Real Chrome + Port + Profile Folder + chrome.exe + Kill Chrome
         r1 = ttk.Frame(box)
         r1.grid(row=1, column=0, columnspan=3, sticky="ew", **pad)
         ttk.Checkbutton(r1, text="Use Real Chrome (Port:", variable=self.var_use_real_chrome, command=self.update_summary).pack(side="left")
@@ -1050,7 +1134,6 @@ class App(tk.Tk):
         ttk.Button(r1, text="...", width=3, command=self.pick_chrome_exe).pack(side="left", padx=(0, 6))
         ttk.Button(r1, text="Kill Chrome", command=self.kill_all_chrome).pack(side="left")
 
-        # Row 2: Timings + Zoom + Workers
         r2 = ttk.Frame(box)
         r2.grid(row=2, column=0, columnspan=3, sticky="w", **pad)
         ttk.Label(r2, text="Load wait (s):").pack(side="left")
@@ -1066,7 +1149,6 @@ class App(tk.Tk):
         ttk.Label(r2, text="Workers:").pack(side="left")
         ttk.Spinbox(r2, from_=1, to=4, width=3, textvariable=self.var_workers).pack(side="left", padx=(3, 0))
 
-        # Row 3: Checkboxes
         r3 = ttk.Frame(box)
         r3.grid(row=3, column=0, columnspan=3, sticky="ew", **pad)
         ttk.Checkbutton(r3, text="Close browser when finished", variable=self.var_close_on_finish).pack(side="left", padx=(0, 10))
@@ -1078,11 +1160,11 @@ class App(tk.Tk):
         ttk.Checkbutton(r3, text="Resume", variable=self.var_resume).pack(side="left", padx=(0, 10))
         ttk.Checkbutton(r3, text="Continue if missing", variable=self.var_continue).pack(side="left")
 
-        # ----- Site Profile Management Bar -----
-        site_bar = ttk.LabelFrame(self, text="Site Profile, Per-Site Customization & Local Settings Backup")
+        site_bar = ttk.LabelFrame(self, text="Site Profile, Multi-Module Templates & Local Settings Backup")
         site_bar.pack(fill="x", padx=10, pady=(4, 0))
+
         sb_in = ttk.Frame(site_bar)
-        sb_in.pack(fill="x", padx=8, pady=5)
+        sb_in.pack(fill="x", padx=8, pady=(5, 2))
 
         ttk.Label(sb_in, text="Active Site:").pack(side="left")
         self.cmb_set = ttk.Combobox(sb_in, state="readonly", width=24)
@@ -1099,14 +1181,31 @@ class App(tk.Tk):
         self.lbl_site_info = ttk.Label(sb_in, text="", foreground="#0E8EE6")
         self.lbl_site_info.pack(side="right", padx=8)
 
-        # ----- Main Panes -----
+        mod_in = ttk.Frame(site_bar)
+        mod_in.pack(fill="x", padx=8, pady=(2, 6))
+
+        ttk.Label(mod_in, text="Site Module:").pack(side="left")
+        self.cmb_mod = ttk.Combobox(mod_in, state="readonly", width=22)
+        self.cmb_mod.pack(side="left", padx=(6, 6))
+        self.cmb_mod.bind("<<ComboboxSelected>>", self.on_module_selected)
+
+        ttk.Button(mod_in, text="+ Add Module", command=self.add_module).pack(side="left")
+        ttk.Button(mod_in, text="Duplicate", command=self.duplicate_module).pack(side="left", padx=4)
+        ttk.Button(mod_in, text="Rename", command=self.rename_module).pack(side="left", padx=2)
+        ttk.Button(mod_in, text="Delete", command=self.delete_module).pack(side="left", padx=4)
+
+        ttk.Label(mod_in, text="Auto-Match URL Pattern (opt):").pack(side="left", padx=(14, 4))
+        ent_pat = ttk.Entry(mod_in, textvariable=self.var_mod_pattern, width=28)
+        ent_pat.pack(side="left", fill="x", expand=True)
+        ent_pat.bind("<KeyRelease>", self.on_pattern_changed)
+        ttk.Label(mod_in, text="(e.g. /p/ | datasheet | re:\\d+)", foreground="#6E6E6E").pack(side="left", padx=(6, 0))
+
         pane_opts = dict(sashwidth=8, sashrelief="flat", bg="#E9ECF1", bd=0, opaqueresize=True)
         main_pane = tk.PanedWindow(self, orient="vertical", **pane_opts)
         main_pane.pack(fill="both", expand=True, padx=10, pady=4)
         mid = tk.PanedWindow(main_pane, orient="horizontal", **pane_opts)
         main_pane.add(mid, stretch="always", minsize=240)
 
-        # 1. Left Pane: Mode Switcher (Direct URLs Mode vs Keyword Search Mode)
         left_box = ttk.LabelFrame(mid, text="1. Input Source (Direct URLs vs Keyword Search Mode)")
         mid.add(left_box, stretch="always", minsize=340)
 
@@ -1115,7 +1214,6 @@ class App(tk.Tk):
         ttk.Radiobutton(mode_bar, text="Direct URLs List", variable=self.var_input_mode, value="urls", command=self.switch_input_mode).pack(side="left", padx=(0, 12))
         ttk.Radiobutton(mode_bar, text="Keyword Search Mode (Search Box)", variable=self.var_input_mode, value="search", command=self.switch_input_mode).pack(side="left")
 
-        # Frame A: Direct URLs
         self.frm_urls = ttk.Frame(left_box)
         self.txt_links = scrolledtext.ScrolledText(self.frm_urls, height=10, width=36, wrap="none", **TEXT_OPTS)
         self.txt_links.pack(fill="both", expand=True, padx=6, pady=4)
@@ -1128,7 +1226,6 @@ class App(tk.Tk):
         self.lbl_count.pack(side="right")
         self.txt_links.bind("<<Modified>>", self.on_links_modified)
 
-        # Frame B: Keyword Search Mode
         self.frm_search = ttk.Frame(left_box)
         s_grid = ttk.Frame(self.frm_search)
         s_grid.pack(fill="x", padx=6, pady=4)
@@ -1156,17 +1253,16 @@ class App(tk.Tk):
         self.lbl_kw_count.pack(side="right")
         self.txt_keywords.bind("<<Modified>>", self.on_kw_modified)
 
-        # 2. Right Pane: Sequential Workflow
-        seq_box = ttk.LabelFrame(mid, text="2. Site Workflow (Drag & Drop rows to reorder | Hold Alt+Click in browser to bypass)")
-        mid.add(seq_box, stretch="always", minsize=560)
-        self.lst_seq = tk.Listbox(seq_box, height=8, activestyle="none", exportselection=False, **LIST_OPTS)
+        self.seq_box = ttk.LabelFrame(mid, text="2. Module Workflow (Drag & Drop rows to reorder | Hold Alt+Click in browser to bypass)")
+        mid.add(self.seq_box, stretch="always", minsize=560)
+        self.lst_seq = tk.Listbox(self.seq_box, height=8, activestyle="none", exportselection=False, **LIST_OPTS)
         self.lst_seq.pack(fill="both", expand=True, padx=6, pady=(6, 4))
 
         self.lst_seq.bind("<Button-1>", self.on_drag_start)
         self.lst_seq.bind("<B1-Motion>", self.on_drag_motion)
         self.lst_seq.bind("<ButtonRelease-1>", self.on_drag_release)
 
-        sr1 = ttk.Frame(seq_box)
+        sr1 = ttk.Frame(self.seq_box)
         sr1.pack(fill="x", padx=6, pady=2)
         self.btn_rec_click = ttk.Button(sr1, text="\u25CF Record Click", command=lambda: self.toggle_record("click"))
         self.btn_rec_click.pack(side="left")
@@ -1177,7 +1273,7 @@ class App(tk.Tk):
         ttk.Button(sr1, text="+ Zoom", command=self.add_zoom_step).pack(side="left", padx=3)
         ttk.Button(sr1, text="+ Wait", command=self.add_wait).pack(side="left")
 
-        sr2 = ttk.Frame(seq_box)
+        sr2 = ttk.Frame(self.seq_box)
         sr2.pack(fill="x", padx=6, pady=(2, 6))
         ttk.Button(sr2, text="Rename / Edit Val", command=self.rename_or_edit_seq).pack(side="left")
         ttk.Button(sr2, text="Text / Link / Both", command=self.toggle_extract_attr).pack(side="left", padx=3)
@@ -1188,7 +1284,6 @@ class App(tk.Tk):
         ttk.Button(sr2, text="Down", width=5, command=lambda: self.move_seq(1)).pack(side="left")
         ttk.Button(sr2, text="Clear", command=self.clear_seq).pack(side="right")
 
-        # Log
         logf = ttk.LabelFrame(main_pane, text="Scraping Log")
         main_pane.add(logf, stretch="always", minsize=90)
         self.txt_log = scrolledtext.ScrolledText(logf, height=7, state="disabled", **TEXT_OPTS)
@@ -1208,7 +1303,6 @@ class App(tk.Tk):
             self.frm_urls.pack(fill="both", expand=True)
         self.update_summary()
 
-    # ----- Drag & Drop Handlers -----
     def on_drag_start(self, event):
         idx = self.lst_seq.nearest(event.y)
         if 0 <= idx < len(self.sequence):
@@ -1271,7 +1365,7 @@ class App(tk.Tk):
         engine_txt = f"Real Chrome (:{num(self.var_debug_port, 9222)})" if self.var_use_real_chrome.get() else "Auto ChromeDriver"
         inc_txt = "   \u00B7   Incognito: ON" if self.var_incognito.get() else ""
         self.lbl_summary.config(
-            text=f"Mode: {mode_lbl}   \u00B7   Engine: {engine_txt}{inc_txt}   \u00B7   Zoom: {num(self.var_zoom_pct, 100)}%   \u00B7   Steps: {len(self.sequence)} ({extract_count} fields)"
+            text=f"Mode: {mode_lbl}   \u00B7   Engine: {engine_txt}{inc_txt}   \u00B7   Zoom: {num(self.var_zoom_pct, 100)}%   \u00B7   Module [{self.current_module}]: {len(self.sequence)} steps ({extract_count} fields)"
         )
         if self.current_set == ALL_SITES:
             self.lbl_site_info.config(text="Using Global Options")
@@ -1315,7 +1409,7 @@ class App(tk.Tk):
         for u in links:
             h = host_of(u)
             if h and h not in self.sequence_sets:
-                self.sequence_sets[h] = []
+                self.sequence_sets[h] = normalize_site_entry([])
                 added += 1
         self.refresh_sets()
         self.update_summary()
@@ -1366,28 +1460,31 @@ class App(tk.Tk):
             messagebox.showinfo("Export Excel", "No scraped data found yet.")
             return
 
-        by_site = {}
+        by_sheet = {}
         with open(json_path, encoding="utf-8") as f:
             for line in f:
                 if not line.strip():
                     continue
                 rec = json.loads(line)
                 site_key = rec.get("site_profile", "General")
-                by_site.setdefault(site_key, []).append(rec)
+                mod_name = rec.get("module_name") or DEFAULT_MODULE
+                sheet_key = f"{site_key} - {mod_name}" if mod_name != DEFAULT_MODULE else site_key
+                by_sheet.setdefault(sheet_key, []).append(rec)
 
         sheets_dict = {}
-        for site_key, records in by_site.items():
+        for sheet_key, records in by_sheet.items():
             field_names = []
             for r in records:
                 for k in r.get("fields", {}).keys():
                     if k not in field_names:
                         field_names.append(k)
 
-            header = ["Keyword", "Input Link", "Final URL", "Page Title", "Row #", "Status", "Notes", "Timestamp"] + field_names
+            header = ["Module", "Keyword", "Input Link", "Final URL", "Page Title", "Row #", "Status", "Notes", "Timestamp"] + field_names
             rows = [header]
             for r in records:
                 fdict = r.get("fields", {})
                 row = [
+                    r.get("module_name", DEFAULT_MODULE),
                     r.get("keyword", ""),
                     r.get("link", ""),
                     r.get("final_url", r.get("link", "")),
@@ -1398,7 +1495,7 @@ class App(tk.Tk):
                     r.get("timestamp", ""),
                 ] + [fdict.get(fn, "") for fn in field_names]
                 rows.append(row)
-            sheets_dict[site_key] = rows
+            sheets_dict[sheet_key] = rows
 
         out_xlsx = os.path.join(folder, "MultiSite_Extracted_Data.xlsx")
         try:
@@ -1408,16 +1505,105 @@ class App(tk.Tk):
         except Exception as e:
             messagebox.showerror("Export Excel", f"Error writing Excel:\n{e}")
 
-    # ----- Site Profiles & Per-Site Options -----
+    # ----- Site Profiles, Modules & Per-Site Options -----
+    def refresh_modules_ui(self):
+        entry = self.get_site_entry()
+        mods = list(entry["modules"].keys())
+        act = entry["active_module"]
+        self.cmb_mod.config(values=mods)
+        self.cmb_mod.set(act)
+        self.var_mod_pattern.set(entry["modules"][act].get("pattern", ""))
+        self.seq_box.config(text=f"2. Module Workflow [{self.current_set} :: {act}] (Drag & Drop rows to reorder | Hold Alt+Click to bypass)")
+
+    def on_module_selected(self, _event=None):
+        chosen = self.cmb_mod.get()
+        if chosen:
+            self.current_module = chosen
+            self.refresh_modules_ui()
+            self.refresh_sequence()
+            self.update_summary()
+
+    def on_pattern_changed(self, _event=None):
+        entry = self.get_site_entry()
+        entry["modules"][entry["active_module"]]["pattern"] = self.var_mod_pattern.get()
+
+    def add_module(self):
+        name = simpledialog.askstring("New Module", f"Enter module name for [{self.current_set}]:", parent=self)
+        mname = (name or "").strip()
+        if not mname:
+            return
+        entry = self.get_site_entry()
+        if mname in entry["modules"]:
+            messagebox.showwarning("New Module", f"Module '{mname}' already exists in this site.")
+            return
+        entry["modules"][mname] = {"pattern": "", "steps": []}
+        entry["active_module"] = mname
+        self.refresh_modules_ui()
+        self.refresh_sequence()
+        self.update_summary()
+
+    def duplicate_module(self):
+        entry = self.get_site_entry()
+        src_name = entry["active_module"]
+        new_name = simpledialog.askstring("Duplicate Module", f"Copy '{src_name}' as:", initialvalue=f"{src_name}_Copy", parent=self)
+        mname = (new_name or "").strip()
+        if not mname:
+            return
+        if mname in entry["modules"]:
+            messagebox.showwarning("Duplicate Module", f"Module '{mname}' already exists.")
+            return
+        src_mod = entry["modules"][src_name]
+        entry["modules"][mname] = {
+            "pattern": src_mod.get("pattern", ""),
+            "steps": json.loads(json.dumps(src_mod.get("steps", []))),
+        }
+        entry["active_module"] = mname
+        self.refresh_modules_ui()
+        self.refresh_sequence()
+        self.update_summary()
+
+    def rename_module(self):
+        entry = self.get_site_entry()
+        old_name = entry["active_module"]
+        new_name = simpledialog.askstring("Rename Module", "Enter new module name:", initialvalue=old_name, parent=self)
+        mname = (new_name or "").strip()
+        if not mname or mname == old_name:
+            return
+        if mname in entry["modules"]:
+            messagebox.showwarning("Rename Module", f"Module '{mname}' already exists.")
+            return
+        entry["modules"][mname] = entry["modules"].pop(old_name)
+        entry["active_module"] = mname
+        self.refresh_modules_ui()
+        self.refresh_sequence()
+        self.update_summary()
+
+    def delete_module(self):
+        entry = self.get_site_entry()
+        if len(entry["modules"]) <= 1:
+            messagebox.showinfo("Delete Module", "Each site must keep at least one module.")
+            return
+        mname = entry["active_module"]
+        if messagebox.askyesno("Delete Module", f"Delete module '{mname}' from '{self.current_set}'?"):
+            entry["modules"].pop(mname, None)
+            entry["active_module"] = next(iter(entry["modules"]))
+            self.refresh_modules_ui()
+            self.refresh_sequence()
+            self.update_summary()
+
     def refresh_sets(self):
         keys = [ALL_SITES] + sorted((set(self.sequence_sets) | set(self.site_settings)) - {ALL_SITES})
         self.cmb_set.config(values=[ALL_SITES_LABEL if k == ALL_SITES else k for k in keys])
         self.cmb_set.set(ALL_SITES_LABEL if self.current_set == ALL_SITES else self.current_set)
+        self.get_site_entry(self.current_set)
+        self.refresh_modules_ui()
         self.update_summary()
 
     def on_set_selected(self, _event=None):
         label = self.cmb_set.get()
         self.current_set = ALL_SITES if label == ALL_SITES_LABEL else label
+        self.get_site_entry(self.current_set)
+        self.refresh_modules_ui()
         self.refresh_sequence()
         self.update_summary()
 
@@ -1427,7 +1613,7 @@ class App(tk.Tk):
         text = simpledialog.askstring("New Site Profile", "Enter domain name (e.g. st.com, ti.com):", initialvalue=first, parent=self)
         host = host_of(text.strip()) if text else ""
         if host:
-            self.sequence_sets.setdefault(host, [])
+            self.sequence_sets.setdefault(host, normalize_site_entry([]))
             self.current_set = host
             self.refresh_sets()
             self.refresh_sequence()
@@ -1444,7 +1630,7 @@ class App(tk.Tk):
         if new_host in self.sequence_sets:
             messagebox.showwarning("Rename Site", f"A profile named '{new_host}' already exists.")
             return
-        self.sequence_sets[new_host] = self.sequence_sets.pop(old_host, [])
+        self.sequence_sets[new_host] = self.sequence_sets.pop(old_host, normalize_site_entry([]))
         if old_host in self.site_settings:
             self.site_settings[new_host] = self.site_settings.pop(old_host)
         self.current_set = new_host
@@ -1537,7 +1723,6 @@ class App(tk.Tk):
         ttk.Button(btns, text="Cancel", command=dlg.destroy).pack(side="left", padx=6)
         dlg.grab_set()
 
-    # ----- Sequence List UI -----
     def refresh_sequence(self, select=None):
         self.lst_seq.delete(0, "end")
         for n, item in enumerate(self.sequence, 1):
@@ -1667,7 +1852,7 @@ class App(tk.Tk):
             self.refresh_sequence(select=j)
 
     def clear_seq(self):
-        if self.sequence and messagebox.askyesno("Clear", "Remove all steps in this profile?"):
+        if self.sequence and messagebox.askyesno("Clear", f"Remove all steps in module '{self.current_module}'?"):
             self.sequence = []
             self.refresh_sequence()
 
@@ -1699,7 +1884,6 @@ class App(tk.Tk):
                 item["zoom"] = new_z
                 self.refresh_sequence(select=idx)
 
-    # ----- Visual Picker -----
     def toggle_record(self, mode):
         if self.rec_mode is not None:
             self.rec_stop.set()
@@ -1848,10 +2032,10 @@ class App(tk.Tk):
                             if messagebox.askyesno(
                                 "Update Ready",
                                 f"Version {data['ver']} has been downloaded.\n"
-                                f"Close now to apply the update immediately?\n"
+                                f"Close and restart now to apply the update immediately?\n"
                                 f"(Otherwise it will apply automatically when you exit.)",
                             ):
-                                self.restart_for_update = False
+                                self.restart_for_update = True
                                 self.on_close()
                                 return
                     elif st == "up_to_date" and manual:
@@ -1962,7 +2146,6 @@ class App(tk.Tk):
             schedule_silent_exe_replace(self.staged_update_path, restart_after=self.restart_for_update)
         self.destroy()
 
-    # ----- Execution Engine -----
     def build_cfg(self):
         folder = self.var_folder.get().strip()
         mode = self.var_input_mode.get()
@@ -2055,10 +2238,9 @@ class App(tk.Tk):
         q = self.msg_queue
         link = task["link"]
         kw = task["keyword"]
-        site_key = resolve_site_key(cfg["sequence_sets"], link)
+        site_key, mod_name, seq = resolve_site_and_module(cfg["sequence_sets"], link)
         scfg = apply_site_cfg(cfg, link)
-        seq = cfg["sequence_sets"].get(site_key, [])
-        q.put(("log", f"TEST [{site_key}] {f'(Keyword: {kw}) ' if kw else ''}on: {link}"))
+        q.put(("log", f"TEST [{site_key} :: {mod_name}] {f'(Keyword: {kw}) ' if kw else ''}on: {link}"))
         driver = None
         try:
             driver = self.new_driver(scfg, worker_idx=0)
@@ -2272,18 +2454,18 @@ class App(tk.Tk):
                 kw = task["keyword"]
                 is_first_domain = task["is_first"]
 
-                site_key = resolve_site_key(cfg["sequence_sets"], link)
+                site_key, mod_name, seq = resolve_site_and_module(cfg["sequence_sets"], link)
                 scfg = apply_site_cfg(cfg, link)
-                seq = cfg["sequence_sets"].get(site_key, [])
-                driver_sig = (scfg.get("headless"), scfg.get("incognito"), scfg.get("stealth"), scfg.get("use_real_chrome"))
+                is_real = bool(scfg.get("use_real_chrome"))
+                driver_sig = (scfg.get("headless"), scfg.get("incognito"), scfg.get("stealth"), is_real)
 
                 if holder["d"] is not None and holder["sig"] != driver_sig:
-                    self.close_driver(holder["d"], is_real_chrome=holder["real"], force_close=True)
+                    self.close_driver(holder["d"], is_real_chrome=holder["real"], force_close=not holder["real"])
                     holder["d"] = None
                     holder["last_url"] = None
 
                 label = f"[KW: {kw}] {link}" if kw else link
-                self.msg_queue.put(("log", f"[{i + 1}/{ctx['total']}] ({site_key}) {label}"))
+                self.msg_queue.put(("log", f"[{i + 1}/{ctx['total']}] ({site_key} :: {mod_name}) {label}"))
 
                 final_url, page_title, rows_data, status, note = link, "", [{}], "Error", ""
                 for attempt in range(1, cfg["retries"] + 2):
@@ -2293,7 +2475,7 @@ class App(tk.Tk):
                         if holder["d"] is None:
                             holder["d"] = self.new_driver(scfg, worker_idx=worker_idx)
                             holder["sig"] = driver_sig
-                            holder["real"] = bool(scfg.get("use_real_chrome"))
+                            holder["real"] = is_real
                             holder["last_url"] = None
 
                         need_reload = (not kw) or (holder["last_url"] != link) or (attempt > 1)
@@ -2308,14 +2490,14 @@ class App(tk.Tk):
                         note = str(e).splitlines()[0] if str(e) else type(e).__name__
                         self.msg_queue.put(("log", f"   Attempt {attempt} error: {note}"))
                         if holder["d"]:
-                            self.close_driver(holder["d"], is_real_chrome=holder["real"], force_close=True)
+                            self.close_driver(holder["d"], is_real_chrome=holder["real"], force_close=not holder["real"])
                             holder["d"] = None
                             holder["last_url"] = None
                     if attempt <= cfg["retries"] and not self.stop_event.is_set():
                         time.sleep(2)
 
-                if scfg.get("new_browser") and holder["d"]:
-                    self.close_driver(holder["d"], is_real_chrome=holder["real"], force_close=True)
+                if scfg.get("new_browser") and holder["d"] and not holder["real"]:
+                    self.close_driver(holder["d"], is_real_chrome=False, force_close=True)
                     holder["d"] = None
                     holder["last_url"] = None
 
@@ -2324,6 +2506,7 @@ class App(tk.Tk):
                     for r_idx, fdict in enumerate(rows_data, 1):
                         rec = {
                             "site_profile": site_key if site_key != ALL_SITES else (host_of(link) or "General"),
+                            "module_name": mod_name,
                             "keyword": kw,
                             "link": link,
                             "final_url": final_url,
@@ -2345,7 +2528,7 @@ class App(tk.Tk):
             self.close_driver(
                 holder["d"],
                 is_real_chrome=holder["real"],
-                force_close=cfg.get("close_on_finish", False),
+                force_close=cfg.get("close_on_finish", False) and not holder["real"],
             )
 
     def run_job(self, tasks, cfg):
